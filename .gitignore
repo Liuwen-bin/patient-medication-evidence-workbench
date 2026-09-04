@@ -26,6 +26,8 @@ tmp/
 artifacts/tmp/
 artifacts/evaluation/
 artifacts/live-runs/
+artifacts/service-*.sqlite*
+artifacts/service-*.api.lock
 playwright-report/
 test-results/
 

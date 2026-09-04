@@ -105,13 +105,15 @@ Set-Location C:\Users\Administrator\Downloads\dm_spl_release_homeopathic\homeopa
 $env:HEALTH_MCP_URL = "http://127.0.0.1:8000/mcp"
 $env:DRUG_MCP_URL = "http://127.0.0.1:8010/mcp"
 $env:AGENT_LLM_ENABLED = "true"
-$env:REVIEW_API_KEY = "replace-for-local-run"
+$env:ALLOW_INSECURE_LOCAL_MUTATIONS = "true"
+Remove-Item Env:REVIEW_API_KEY -ErrorAction SilentlyContinue
 $env:REVIEW_API_REVIEWER_ID = "pharmacist-demo"
 medication-review-api
 ```
 
-打开 `http://127.0.0.1:8020`。API 只支持单 worker；多进程会绕过当前进程内 mutation 锁，
-因此启动时由 checkpoint lease 明确拒绝。
+打开 `http://127.0.0.1:8020`。`ALLOW_INSECURE_LOCAL_MUTATIONS` 只用于回环地址上的浏览器演示；
+自动化评测或非回环部署必须改用 `REVIEW_API_KEY` 和受控客户端。API 只支持单 worker；多进程
+会绕过当前进程内 mutation 锁，因此启动时由 checkpoint lease 明确拒绝。
 
 ## 测试与评测
 
