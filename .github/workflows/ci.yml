@@ -1,0 +1,41 @@
+name: CI
+"on":
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e ".[test]"
+      - name: Core tests
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: >-
+          python -m pytest tests
+          --ignore-glob=tests/test_web_*.py
+          -q -p pytest_asyncio.plugin
+      - run: python -m compileall -q src tests
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e ".[test]"
+      - run: python -m playwright install --with-deps chromium
+      - name: Browser tests
+        run: >-
+          python -m pytest
+          tests/test_web_render.py
+          tests/test_web_decisions.py
+          tests/test_web_visual.py -q

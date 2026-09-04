@@ -1,0 +1,31 @@
+name: Live integration
+"on":
+  workflow_dispatch:
+    inputs:
+      commit_synthetic:
+        description: Commit twice to an isolated synthetic database
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  live-integration:
+    environment: medication-review-live
+    runs-on: [self-hosted, windows, medication-review-live]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run online cases
+        env:
+          AGENT_LLM_ENABLED: "true"
+          AGENT_LLM_BASE_URL: ${{ secrets.AGENT_LLM_BASE_URL }}
+          AGENT_LLM_API_KEY: ${{ secrets.AGENT_LLM_API_KEY }}
+          AGENT_LLM_MODEL: ${{ secrets.AGENT_LLM_MODEL }}
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File scripts/run-live-evaluation.ps1 -CommitSynthetic:${{ inputs.commit_synthetic }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: online-integration-report
+          path: artifacts/evaluation/online-integration-report.json
+          retention-days: 14
