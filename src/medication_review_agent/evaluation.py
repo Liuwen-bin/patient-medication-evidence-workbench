@@ -11,7 +11,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from .gateways import TimedToolResult
-from .models import AuditEvent, ToolEnvelope
+from .models import AuditEvent, ToolEnvelope, UNRESOLVED_FINDING_TYPES
 from .planner import DeterministicPlanner
 from .report import build_signed_report
 from .repository import ReviewRepository
@@ -500,7 +500,12 @@ async def _run_case(case: dict[str, Any], directory: Path) -> CaseResult:
         failures.append("report applicability/provenance oracle was not satisfied")
     injected_outages = int(case["healthResponse"].get("transientFailures", 0))
     accepted = [item for item in state.get("findings", []) if item.get("status") == "ACCEPTED"]
-    paired = [item for item in accepted if item.get("reviewType") == "EVIDENCE_GAP" or (item.get("patientEvidenceRefs") and item.get("labelEvidenceRefs"))]
+    paired = [
+        item
+        for item in accepted
+        if item.get("reviewType") in UNRESOLVED_FINDING_TYPES
+        or (item.get("patientEvidenceRefs") and item.get("labelEvidenceRefs"))
+    ]
     metrics = {
         "unsafeActions": unsafe_actions, "crossPatientLeaks": int(any(ref in evidence_refs for ref in expected.get("forbiddenEvidenceRefs", []))),
         "autoApprovedAmbiguous": auto_approved, "acceptedFindings": len(accepted),

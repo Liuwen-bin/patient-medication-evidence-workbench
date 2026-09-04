@@ -20,7 +20,11 @@ from medication_review_agent.retrieval import (
     retrieval_attempt_key,
 )
 from medication_review_agent.repository import ReviewRepository
-from medication_review_agent.workflow import deidentified_patient_features, state_to_snapshot
+from medication_review_agent.workflow import (
+    _label_evidence_bindings,
+    deidentified_patient_features,
+    state_to_snapshot,
+)
 
 from tests.fakes import (
     FakeDrugGateway,
@@ -91,6 +95,33 @@ def test_workflow_reexports_all_interrupt_contracts() -> None:
     assert compatibility_type is extracted_type
 
 
+def test_document_identity_binding_requires_every_claimed_product_to_be_current() -> None:
+    evidence = [{
+        "evidenceId": "multi-product-ingredient",
+        "source": "SPL",
+        "evidenceRef": "SPL:shared-doc#ingredients",
+        "productIds": ["product-1", "product-2"],
+        "topic": "ingredients",
+        "documentId": "shared-doc",
+        "documentVersion": "1",
+        "contentHash": "1" * 64,
+    }]
+    current_documents = {
+        "product-1": frozenset({("shared-doc", "1", "1" * 64)}),
+        "product-2": frozenset({("shared-doc", "2", "2" * 64)}),
+    }
+
+    refs, ids = _label_evidence_bindings(
+        evidence,
+        {"product-1", "product-2"},
+        topics=frozenset({"ingredients"}),
+        document_identities=current_documents,
+    )
+
+    assert refs == []
+    assert ids == []
+
+
 @pytest.mark.asyncio
 async def test_normalized_medication_preserves_referenced_resource_evidence(
     tmp_path: Path,
@@ -137,14 +168,20 @@ def test_deidentified_features_drop_nested_identity_values() -> None:
         ],
         "specialPopulations": [
             "pregnant",
-            {"flag": "older_adult", "patientId": "patient-secret"},
+            {
+                "id": "observation-secret",
+                "name": "Pregnancy status",
+                "value": "Pregnant",
+                "evidenceRef": "FHIR:Observation/observation-secret",
+                "patientId": "patient-secret",
+            },
         ],
     })
 
     assert features == {
         "ageBand": "adult",
         "allergyTerms": ["aspirin"],
-        "specialPopulationFlags": ["pregnant"],
+        "specialPopulationFlags": ["Pregnancy status: Pregnant", "pregnant"],
     }
     assert "secret" not in str(features)
 
@@ -359,7 +396,110 @@ async def test_review_continues_with_mapped_and_unmapped_medications(tmp_path: P
     )
     assert result["status"] == "AWAITING_FINDING_REVIEW"
     assert {item["matchClass"] for item in result["medicationMappings"]} == {"EXACT_IDENTIFIER", "UNMAPPED"}
-    assert any(item["reviewType"] == "EVIDENCE_GAP" for item in result["findings"])
+    assert any(item["reviewType"] == "PRODUCT_UNMAPPED" for item in result["findings"])
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_label_body_has_a_dedicated_finding_type(tmp_path: Path) -> None:
+    responses = standard_drug_responses({"ARNICA": mapped_response()})
+    responses["search"] = envelope(
+        "INSUFFICIENT_EVIDENCE",
+        {"evidence": []},
+        errors=["No in-scope label evidence was retrieved."],
+    )
+    graph = build_test_graph(
+        tmp_path,
+        FakeHealthGateway(health_context(MED1)),
+        FakeDrugGateway(responses),
+        question="核查标签警告正文",
+    )
+
+    result = await graph.ainvoke(
+        {
+            "reviewId": "review-1",
+            "patientRef": "P001",
+            "question": "核查标签警告正文",
+            "asOf": "2026-08-31",
+        },
+        config={"configurable": {"thread_id": "review-1"}},
+    )
+
+    missing = next(
+        item for item in result["findings"]
+        if item["reviewType"] == "LABEL_EVIDENCE_MISSING"
+    )
+    assert missing["sourceTool"] == "search_label_evidence"
+    assert missing["status"] == "PENDING"
+    assert missing["verificationErrors"] == []
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_allergy_name_matching_product_ingredient_has_dedicated_finding(
+    tmp_path: Path,
+) -> None:
+    responses = standard_drug_responses({"ARNICA": mapped_response()})
+    responses["facts"] = envelope(
+        "OK",
+        {"product": {
+            "productId": "DRUG_PRODUCT::1",
+            "documentId": "doc-1",
+            "documentVersion": "3",
+            "sourcePath": "labels/doc-1.xml",
+            "contentHash": "a" * 64,
+            "activeIngredients": [{
+                "entityId": "INGREDIENT::ARNICA-MONTANA",
+                "name": "Arnica   Montana",
+                "relation": "HAS_ACTIVE_INGREDIENT",
+            }],
+            "inactiveIngredients": [],
+        }},
+        refs=["SPL:doc-1#document"],
+    )
+    health = health_context(MED1)
+    context = dict(health.envelope.data)
+    context["allergies"] = [{
+        "id": "allergy-1",
+        "name": "ARNICA MONTANA",
+        "evidenceRef": "FHIR:AllergyIntolerance/allergy-1",
+    }]
+    health = TimedToolResult(
+        envelope=health.envelope.model_copy(update={"data": context}),
+        latency_ms=health.latency_ms,
+    )
+    graph = build_test_graph(
+        tmp_path,
+        FakeHealthGateway(health),
+        FakeDrugGateway(responses),
+        question="核查过敏名称与产品成分",
+    )
+
+    result = await graph.ainvoke(
+        {
+            "reviewId": "review-1",
+            "patientRef": "P001",
+            "question": "核查过敏名称与产品成分",
+            "asOf": "2026-08-31",
+        },
+        config={"configurable": {"thread_id": "review-1"}},
+    )
+
+    finding = next(
+        item for item in result["findings"]
+        if item["reviewType"] == "INGREDIENT_ALLERGY_NAME_MATCH"
+    )
+    assert finding["comparisonInputs"] == {
+        "allergyName": "arnica montana",
+        "ingredientName": "arnica montana",
+        "ingredientId": "INGREDIENT::ARNICA-MONTANA",
+    }
+    assert set(finding["patientEvidenceRefs"]) == {
+        "FHIR:MedicationRequest/med-1",
+        "FHIR:AllergyIntolerance/allergy-1",
+    }
+    assert finding["labelEvidenceRefs"]
+    assert finding["verificationErrors"] == []
     await graph.checkpointer.conn.close()
 
 
@@ -408,7 +548,10 @@ async def test_finding_review_and_final_signoff_survive_restart(tmp_path: Path) 
     config = {"configurable": {"thread_id": "review-1"}}
     graph = build_test_graph(tmp_path, FakeHealthGateway(health_context(MED1)), drug)
     first = await graph.ainvoke({"reviewId": "review-1", "patientRef": "P001", "asOf": "2026-08-31"}, config=config)
-    target = next(item for item in first["findings"] if item["reviewType"] != "EVIDENCE_GAP")
+    target = next(
+        item for item in first["findings"]
+        if item["reviewType"] == "LABEL_EVIDENCE_REVIEW"
+    )
     finding_id = target["findingId"]
     await graph.checkpointer.conn.close()
     finding_reopened = build_test_graph(tmp_path, FakeHealthGateway(health_context(MED1)), drug)
@@ -559,7 +702,23 @@ async def test_neo4j_set_comparison_builds_duplicate_ingredient_finding(tmp_path
     )
     duplicates = [item for item in result["findings"] if item["reviewType"] == "DUPLICATE_ACTIVE_INGREDIENT"]
     assert duplicates[0]["graphProvenance"]["graphBackend"] == "neo4j"
-    assert duplicates[0]["labelEvidenceRefs"] == ["SPL:doc-1#document"]
+    assert "SPL:doc-1#ingredients" in duplicates[0]["labelEvidenceRefs"]
+    cited = {
+        item["evidenceId"]: item
+        for item in result["evidenceIndex"]
+        if item.get("evidenceId")
+    }
+    assert duplicates[0]["labelEvidenceIds"]
+    assert all(
+        cited[evidence_id]["source"] == "SPL"
+        and cited[evidence_id]["documentVersion"]
+        and cited[evidence_id]["contentHash"]
+        for evidence_id in duplicates[0]["labelEvidenceIds"]
+    )
+    assert {
+        cited[evidence_id]["evidenceRef"]
+        for evidence_id in duplicates[0]["labelEvidenceIds"]
+    } == set(duplicates[0]["labelEvidenceRefs"])
     await graph.checkpointer.conn.close()
 
 
@@ -622,7 +781,7 @@ async def test_computed_claim_carries_rule_inputs_and_both_reference_sets(
         "FHIR:MedicationRequest/med-1",
         "FHIR:MedicationRequest/med-2",
     ]
-    assert computed["labelEvidenceRefs"] == ["SPL:doc-1#document"]
+    assert computed["labelEvidenceRefs"] == ["SPL:doc-1#ingredients"]
     await graph.checkpointer.conn.close()
 
 
@@ -639,7 +798,10 @@ async def test_pharmacist_cannot_accept_non_gap_finding_without_paired_evidence(
     first = await graph.ainvoke(
         {"reviewId": "review-1", "patientRef": "P001", "asOf": "2026-08-31"}, config=config,
     )
-    target = next(item for item in first["findings"] if item["reviewType"] != "EVIDENCE_GAP")
+    target = next(
+        item for item in first["findings"]
+        if item["reviewType"] == "LABEL_EVIDENCE_REVIEW"
+    )
     finding_id = target["findingId"]
     result = await graph.ainvoke(Command(resume={
         "action": "COMPLETE_FINDING_REVIEW", "reviewerId": "pharmacist-demo",
@@ -647,6 +809,65 @@ async def test_pharmacist_cannot_accept_non_gap_finding_without_paired_evidence(
     }), config=config)
     assert result["status"] == "NEEDS_MORE_EVIDENCE"
     updated = next(item for item in result["findings"] if item["findingId"] == finding_id)
+    assert updated["status"] == "NEEDS_MORE_EVIDENCE"
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pharmacist_cannot_accept_label_evidence_with_invalid_provenance(
+    tmp_path: Path,
+) -> None:
+    responses = standard_drug_responses({"ARNICA": mapped_response()})
+    search = responses["search"]
+    assert isinstance(search, TimedToolResult)
+    invalid_evidence = [
+        {
+            **item,
+            "evidenceRef": f"SPL:wrong-document#{item['sectionId']}",
+        }
+        for item in search.envelope.data["evidence"]
+    ]
+    responses["search"] = envelope(
+        "OK",
+        {"evidence": invalid_evidence},
+        refs=[item["evidenceRef"] for item in invalid_evidence],
+    )
+    graph = build_test_graph(
+        tmp_path,
+        FakeHealthGateway(health_context(MED1)),
+        FakeDrugGateway(responses),
+    )
+    config = {"configurable": {"thread_id": "review-1"}}
+
+    first = await graph.ainvoke(
+        {"reviewId": "review-1", "patientRef": "P001", "asOf": "2026-08-31"},
+        config=config,
+    )
+    target = next(
+        item
+        for item in first["findings"]
+        if item["reviewType"] == "LABEL_EVIDENCE_REVIEW"
+    )
+    assert "invalid_label_evidence_binding" in target["verificationErrors"]
+
+    result = await graph.ainvoke(
+        Command(
+            resume={
+                "action": "COMPLETE_FINDING_REVIEW",
+                "reviewerId": "pharmacist-demo",
+                "decisions": [
+                    {
+                        "action": "ACCEPT_FINDING",
+                        "findingId": target["findingId"],
+                    }
+                ],
+            }
+        ),
+        config=config,
+    )
+    updated = next(
+        item for item in result["findings"] if item["findingId"] == target["findingId"]
+    )
     assert updated["status"] == "NEEDS_MORE_EVIDENCE"
     await graph.checkpointer.conn.close()
 
@@ -1771,7 +1992,10 @@ async def test_targeted_reinvestigation_preserves_other_finding_ids_and_decision
     config = {"configurable": {"thread_id": "review-1"}}
     first = await graph.ainvoke({"reviewId": "review-1", "patientRef": "P001", "asOf": "2026-08-31"}, config=config)
     label = next(item for item in first["findings"] if item["reviewType"] == "LABEL_EVIDENCE_REVIEW")
-    gap = next(item for item in first["findings"] if item["reviewType"] == "EVIDENCE_GAP")
+    gap = next(
+        item for item in first["findings"]
+        if item["reviewType"] == "PRODUCT_UNMAPPED"
+    )
     await graph.ainvoke(Command(resume={"action": "COMPLETE_FINDING_REVIEW", "reviewerId": "pharmacist-demo", "decisions": [{"action": "REJECT_FINDING", "findingId": gap["findingId"]}]}), config=config)
     updated = await graph.ainvoke(Command(resume={"action": "COMPLETE_FINDING_REVIEW", "reviewerId": "pharmacist-demo", "decisions": [{"action": "REQUEST_MORE_EVIDENCE", "findingId": label["findingId"]}]}), config=config)
     preserved = next(item for item in updated["findings"] if item["findingId"] == gap["findingId"])
@@ -2513,6 +2737,114 @@ async def test_refresh_keeps_reviewed_evidence_snapshot_when_reference_is_reused
 
 
 @pytest.mark.asyncio
+async def test_duplicate_refresh_does_not_bind_stale_ingredient_document_version(
+    tmp_path: Path,
+) -> None:
+    med2 = {
+        **MED2,
+        "medication": "ARNICA TWO",
+        "identifiers": [{"system": "ndc", "code": "2"}],
+    }
+    mapped_two = envelope("OK", {
+        "matchClass": "EXACT_IDENTIFIER",
+        "autoAcceptable": True,
+        "selectedProductId": "DRUG_PRODUCT::2",
+        "candidates": [],
+        "unmatchedFields": [],
+    })
+    responses = standard_drug_responses({
+        "ARNICA": mapped_response(),
+        "ARNICA TWO": mapped_two,
+    })
+
+    def fact(product_id: str, document_id: str, version: str, content: str):
+        return envelope("OK", {"product": {
+            "productId": product_id,
+            "documentId": document_id,
+            "documentVersion": version,
+            "sourcePath": f"labels/{document_id}.xml",
+            "contentHash": content * 64,
+        }})
+
+    def search(
+        product_id: str,
+        document_id: str,
+        version: str,
+        content: str,
+        topics: list[str],
+    ):
+        return envelope("OK", {"evidence": [{
+            "referenceId": f"{document_id}-{topic}-{version}",
+            "evidenceRef": f"SPL:{document_id}#{topic}",
+            "productId": product_id,
+            "documentId": document_id,
+            "documentVersion": version,
+            "sectionId": topic,
+            "sectionCode": "34071-1",
+            "sourcePath": f"labels/{document_id}.xml",
+            "contentHash": content * 64,
+            "topic": topic,
+            "content": f"{topic} evidence version {version}.",
+        } for topic in topics]})
+
+    all_topics = ["identity", "ingredients", "route", "dosage_form", "warnings"]
+    responses["facts"] = [
+        fact("DRUG_PRODUCT::1", "doc-1", "1", "1"),
+        fact("DRUG_PRODUCT::2", "doc-2", "1", "2"),
+        fact("DRUG_PRODUCT::1", "doc-1", "2", "3"),
+        fact("DRUG_PRODUCT::2", "doc-2", "2", "4"),
+    ]
+    responses["search"] = [
+        search("DRUG_PRODUCT::1", "doc-1", "1", "1", all_topics),
+        search("DRUG_PRODUCT::2", "doc-2", "1", "2", all_topics),
+        search("DRUG_PRODUCT::1", "doc-1", "2", "3", ["warnings"]),
+        search("DRUG_PRODUCT::2", "doc-2", "2", "4", ["warnings"]),
+    ]
+    shared = [{"entityId": "INGREDIENT::ARNICA", "name": "ARNICA"}]
+    responses["compare"] = [
+        envelope("OK", {"sharedActiveIngredients": shared}),
+        envelope("OK", {"sharedActiveIngredients": shared}),
+    ]
+    graph = build_test_graph(
+        tmp_path,
+        FakeHealthGateway(health_context(MED1, med2)),
+        FakeDrugGateway(responses),
+    )
+    config = {"configurable": {"thread_id": "review-1"}}
+    first = await graph.ainvoke({
+        "reviewId": "review-1",
+        "patientRef": "P001",
+        "asOf": "2026-08-31",
+    }, config=config)
+    duplicate = next(
+        item for item in first["findings"]
+        if item["reviewType"] == "DUPLICATE_ACTIVE_INGREDIENT"
+    )
+    stale_ingredient_ids = {
+        item["evidenceId"] for item in first["evidenceIndex"]
+        if item.get("source") == "SPL" and item.get("topic") == "ingredients"
+    }
+
+    updated = await graph.ainvoke(Command(resume={
+        "action": "COMPLETE_FINDING_REVIEW",
+        "reviewerId": "pharmacist-demo",
+        "decisions": [{
+            "action": "REQUEST_MORE_EVIDENCE",
+            "findingId": duplicate["findingId"],
+        }],
+    }), config=config)
+
+    refreshed = next(
+        item for item in updated["findings"]
+        if item["findingId"] == duplicate["findingId"]
+    )
+    indexed_ids = {item["evidenceId"] for item in updated["evidenceIndex"]}
+    assert stale_ingredient_ids <= indexed_ids
+    assert not stale_ingredient_ids.intersection(refreshed["labelEvidenceIds"])
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
 async def test_initial_comparison_gap_reinvestigation_reruns_comparison_and_surfaces_duplicate(tmp_path: Path) -> None:
     med2 = {**MED2, "medication": "ARNICA TWO", "identifiers": [{"system": "ndc", "code": "2"}]}
     responses = standard_drug_responses({"ARNICA": mapped_response(), "ARNICA TWO": mapped_response()})
@@ -2534,7 +2866,8 @@ async def test_initial_comparison_gap_reinvestigation_reruns_comparison_and_surf
     assert refreshed["sharedActiveIngredients"]
     assert set(refreshed["medicationIds"]) == {"med-1", "med-2"}
     assert set(refreshed["patientEvidenceRefs"]) == {"FHIR:MedicationRequest/med-1", "FHIR:MedicationRequest/med-2"}
-    assert "SPL:comparison-doc#ingredients" in refreshed["labelEvidenceRefs"]
+    assert "SPL:doc-1#ingredients" in refreshed["labelEvidenceRefs"]
+    assert "SPL:comparison-doc#ingredients" not in refreshed["labelEvidenceRefs"]
     assert refreshed["status"] == "PENDING"
     await graph.checkpointer.conn.close()
 
@@ -2576,7 +2909,10 @@ async def test_unmapped_gap_reinvestigation_reruns_mapping_and_reuses_finding_id
     graph = build_test_graph(tmp_path, FakeHealthGateway(health_context(MED2)), drug)
     config = {"configurable": {"thread_id": "review-1"}}
     first = await graph.ainvoke({"reviewId": "review-1", "patientRef": "P001", "asOf": "2026-08-31"}, config=config)
-    gap = next(item for item in first["findings"] if item["reviewType"] == "EVIDENCE_GAP")
+    gap = next(
+        item for item in first["findings"]
+        if item["reviewType"] == "PRODUCT_UNMAPPED"
+    )
     updated = await graph.ainvoke(Command(resume={"action": "COMPLETE_FINDING_REVIEW", "reviewerId": "pharmacist-demo", "decisions": [{"action": "REQUEST_MORE_EVIDENCE", "findingId": gap["findingId"]}]}), config=config)
     refreshed = next(item for item in updated["findings"] if item["findingId"] == gap["findingId"])
     assert [name for name, _ in drug.calls].count("resolve_medication") == 2

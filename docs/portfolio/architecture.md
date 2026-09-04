@@ -73,12 +73,14 @@ Health MCP 与 Drug MCP 不互相调用，也不共享数据库。Health MCP 暴
 
 ```text
 validate_medication_review_writeback(payload)
-commit_medication_review_writeback(jobId, bundleHash, expectedVersion, confirmed)
+commit_medication_review_writeback(jobId, bundleHash, expectedVersion, confirmed, reviewerId)
 ```
 
 只有 FastAPI 的 `WritebackCoordinator` 可调用。preview 冻结结构化 payload 并计算 hash，不写库；
-commit 校验相同 job/hash/version/confirmed，在单个 SQLite 事务中只新增 `DetectedIssue`、
-`Task`、`Provenance`。重复相同请求返回原资源 ID，不重复插入；同版本不同 hash 返回冲突。
+commit 校验相同 job/hash/version/confirmed/reviewer，在单个 SQLite 事务中只新增 `DetectedIssue`、
+`Task`、`Provenance`。`Provenance.recorded` 取自持久化的 `SIGN_OFF.occurredAt`，而不是构建
+Bundle 时临时生成；时间和 Bundle 一起参与不可变预览。重复相同请求返回原资源 ID，不重复
+插入；同版本不同 hash 返回冲突。
 
 ## 预算与故障语义
 
@@ -100,7 +102,10 @@ commit 校验相同 job/hash/version/confirmed，在单个 SQLite 事务中只�
 审计只保存节点、工具名、结果状态、引用 ID、延迟、重试、模型 ID、prompt version、token、
 估算成本和 fallback 标记，不保存 prompt、隐藏推理、原始患者 payload、SQL、Cypher 或 raw
 tool arguments。在线评测从 `/audit` 聚合 node trace、tool status 和 per-node latency，并将
-缺失字段计入 `missingMetrics`。
+缺失字段计入 `missingMetrics`。患者范围、精确产品、缺失字段使用独立 case oracle；accepted
+Finding 中的 FHIR 引用必须在隔离 Health SQLite 中归属期望患者，SPL 引用必须解析到同一药品的
+`evidenceIndex`，且包含 document version/content hash；源 FHIR 不变和重复写回则由数据库前后
+快照实测。任一项未测量都会降低 coverage。
 
 ## 源码入口
 

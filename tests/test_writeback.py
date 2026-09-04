@@ -38,6 +38,9 @@ def finding(
         selectedProductIds=["DRUG_PRODUCT::1"],
         patientEvidenceRefs=["FHIR:MedicationRequest/med-1"],
         labelEvidenceRefs=["SPL:doc-1#route"],
+        labelEvidenceIds=[
+            "evidence-60b43af3bfea24d82e6d1dc1f6c83fb174925401b3639345abe0a0cefa2e0138"
+        ],
         status=status,
     )
 
@@ -55,12 +58,31 @@ def snapshot(
         contextSnapshot={
             "patient": {"name": "不应发送", "patientNumber": "secret"}
         },
+        evidenceIndex=[{
+            "evidenceId": "evidence-60b43af3bfea24d82e6d1dc1f6c83fb174925401b3639345abe0a0cefa2e0138",
+            "source": "SPL",
+            "evidenceRef": "SPL:doc-1#route",
+            "medicationIds": ["med-1"],
+            "productIds": ["DRUG_PRODUCT::1"],
+            "topic": "route",
+            "summary": "Verified route evidence.",
+            "documentId": "doc-1",
+            "documentVersion": "3",
+            "sectionId": "route",
+            "sourcePath": "labels/doc-1.xml",
+            "contentHash": "a" * 64,
+        }],
         findings=findings if findings is not None else [finding("accepted-1")],
         unresolvedItems=[{
             "kind": "PATIENT_FIELD_MISSING",
             "summary": "Pregnancy status is not recorded.",
             "medicationIds": ["med-1"],
             "evidenceRefs": ["FHIR:MedicationRequest/med-1"],
+        }],
+        humanDecisions=[{
+            "action": "SIGN_OFF",
+            "reviewerId": "pharmacist-1",
+            "occurredAt": "2026-09-04T10:11:12+08:00",
         }],
         version=7,
     )
@@ -93,8 +115,12 @@ class FakeHealthWritebackGateway:
         self.preview_payload = payload
         return self.preview
 
-    async def commit_writeback(self, job_id, bundle_hash, expected_version, confirmed):
-        self.commit_args = (job_id, bundle_hash, expected_version, confirmed)
+    async def commit_writeback(
+        self, job_id, bundle_hash, expected_version, confirmed, reviewer_id
+    ):
+        self.commit_args = (
+            job_id, bundle_hash, expected_version, confirmed, reviewer_id
+        )
         assert self.commit_result is not None
         return self.commit_result
 
@@ -125,6 +151,7 @@ def test_payload_contains_only_completed_verified_review_data() -> None:
 
     assert [item["findingId"] for item in payload["findings"]] == ["accepted-1"]
     assert payload["patientRef"] == "Patient/p1"
+    assert payload["signedAt"] == "2026-09-04T02:11:12Z"
     assert "不应发送" not in encoded
     assert "secret" not in encoded
     assert "contextSnapshot" not in encoded
@@ -142,6 +169,80 @@ def test_accepted_evidence_gap_becomes_an_unresolved_task() -> None:
         item["kind"] == "LABEL_EVIDENCE_MISSING"
         for item in payload["unresolvedItems"]
     )
+
+
+def test_accepted_missing_patient_field_becomes_patient_followup_task() -> None:
+    gap = Finding(
+        findingId="gap-patient-1",
+        reviewType="EVIDENCE_GAP",
+        ruleId="missing-patient-field-v1",
+        summary="Patient allergy information is not recorded.",
+        attentionLevel="HIGH",
+        confidence=1.0,
+        medicationIds=["med-1"],
+        patientEvidenceRefs=["FHIR:MedicationRequest/med-1"],
+        status=FindingStatus.ACCEPTED,
+        missingField="allergies",
+    )
+    review = snapshot(findings=[gap])
+    review.unresolvedItems = []
+
+    payload = build_writeback_payload(review, "pharmacist-1")
+
+    assert [item["kind"] for item in payload["unresolvedItems"]] == [
+        "PATIENT_FIELD_MISSING"
+    ]
+
+
+def test_writeback_rejects_accepted_finding_with_unresolvable_evidence_id() -> None:
+    review = snapshot()
+    review.evidenceIndex = []
+
+    with pytest.raises(WritebackStateError, match="valid SPL evidence"):
+        build_writeback_payload(review, "pharmacist-1")
+
+
+@pytest.mark.parametrize(
+    "review_type", ["PRODUCT_UNMAPPED", "LABEL_EVIDENCE_MISSING"]
+)
+def test_dedicated_unresolved_finding_becomes_matching_task(
+    review_type: str,
+) -> None:
+    unresolved = Finding(
+        findingId="unresolved-1",
+        reviewType=review_type,
+        ruleId="unresolved-v1",
+        summary="Pharmacist follow-up is required.",
+        attentionLevel="HIGH",
+        confidence=1.0,
+        medicationIds=["med-1"],
+        patientEvidenceRefs=["FHIR:MedicationRequest/med-1"],
+        labelEvidenceRefs=[],
+        status=FindingStatus.ACCEPTED,
+    )
+
+    payload = build_writeback_payload(
+        snapshot(findings=[unresolved]), "pharmacist-1"
+    )
+
+    assert payload["findings"] == []
+    assert [item["kind"] for item in payload["unresolvedItems"]] == [
+        "PATIENT_FIELD_MISSING",
+        review_type,
+    ]
+
+
+def test_writeback_payload_requires_a_persisted_signoff_decision() -> None:
+    review = snapshot()
+    review.humanDecisions = []
+
+    with pytest.raises(WritebackStateError, match="sign-off decision"):
+        build_writeback_payload(review, "pharmacist-1")
+
+
+def test_writeback_payload_rejects_requester_different_from_persisted_signer() -> None:
+    with pytest.raises(WritebackStateError, match="signed-off reviewer"):
+        build_writeback_payload(snapshot(), "pharmacist-other")
 
 
 @pytest.mark.asyncio
@@ -172,12 +273,34 @@ async def test_commit_sends_stored_job_values_only() -> None:
     gateway = FakeHealthWritebackGateway(preview_envelope(), committed)
     job = WritebackJob.model_validate(preview_envelope().envelope.data)
 
-    result = await WritebackCoordinator(gateway).commit(job, confirmed=True)
+    result = await WritebackCoordinator(gateway).commit(
+        snapshot(), job, "pharmacist-1", confirmed=True
+    )
 
     assert result["committed"] is True
     assert gateway.commit_args == (
-        "writeback-review-1-7", "a" * 64, 7, True
+        "writeback-review-1-7", "a" * 64, 7, True, "pharmacist-1"
     )
+
+
+@pytest.mark.asyncio
+async def test_commit_rejects_requester_different_from_persisted_signer() -> None:
+    committed = timed_envelope("OK", {
+        "jobId": "writeback-review-1-7",
+        "committed": True,
+        "idempotentReplay": False,
+        "bundleHash": "a" * 64,
+        "created": ["DetectedIssue/mr-di-1"],
+    })
+    gateway = FakeHealthWritebackGateway(preview_envelope(), committed)
+    job = WritebackJob.model_validate(preview_envelope().envelope.data)
+
+    with pytest.raises(WritebackStateError, match="signed-off reviewer"):
+        await WritebackCoordinator(gateway).commit(
+            snapshot(), job, "pharmacist-other", confirmed=True
+        )
+
+    assert gateway.commit_args is None
 
 
 @pytest.mark.asyncio

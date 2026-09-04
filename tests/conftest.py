@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 import socket
 import threading
@@ -22,6 +23,32 @@ from medication_review_agent.repository import ReviewRepository
 from medication_review_agent.workflow import ReviewDependencies
 from tests.fakes import FakeDrugGateway, FakeHealthGateway, envelope, health_context, mapped_response, standard_drug_responses
 from tests.test_workflow import MED1, MED2
+
+
+_CHROMIUM_BLOCKED_PORTS = frozenset({
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69,
+    77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119,
+    123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
+    526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
+    993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000,
+    6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+})
+
+
+def _allocate_ephemeral_port() -> int:
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        return int(reservation.getsockname()[1])
+
+
+def _select_browser_safe_port(
+    allocate: Callable[[], int] = _allocate_ephemeral_port,
+) -> int:
+    for _ in range(32):
+        port = allocate()
+        if port not in _CHROMIUM_BLOCKED_PORTS:
+            return port
+    raise RuntimeError("could not allocate a browser-safe test server port")
 
 
 def _make_app(tmp_path: Path, monkeypatch):
@@ -107,9 +134,7 @@ def client(tmp_path: Path, monkeypatch):
 @pytest.fixture
 def live_server_url(tmp_path: Path, monkeypatch):
     app = _make_app(tmp_path, monkeypatch)
-    with socket.socket() as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
+    port = _select_browser_safe_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()

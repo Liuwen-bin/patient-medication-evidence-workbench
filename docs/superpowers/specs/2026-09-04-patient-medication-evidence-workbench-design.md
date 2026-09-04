@@ -524,11 +524,11 @@ validate_evidence
 
 ```text
 validate_medication_review_writeback(payload)
-commit_medication_review_writeback(jobId, bundleHash, expectedVersion, confirmed)
+commit_medication_review_writeback(jobId, bundleHash, expectedVersion, confirmed, reviewerId)
 ```
 
 第一个工具只校验和生成 Bundle 预览，不写数据库。第二个工具要求
-`confirmed=true`，并在一个 SQLite 事务中提交。模型工具列表不包含这两个工具；只有
+`confirmed=true`，校验提交人与预览审核人一致，并在一个 SQLite 事务中提交。模型工具列表不包含这两个工具；只有
 FastAPI 确定性 writeback handler 可以调用。
 
 ## 12. Finding 与证据模型

@@ -20,14 +20,14 @@
 - 回归测试：`tests/test_planner.py` 的结构化输出、白名单和 fallback 用例；`tests/test_workflow.py` 的 prompt injection 用例。
 - 状态：已修复为显式降级机制。限制是降级计划更保守，不代表模型语义质量达标。
 
-## 失败 2：Milvus/LightRAG 不可用
+## 失败 2：MCP session 与检索存储生命周期不匹配
 
-- 输入条件：2026-09-05 本机真实在线五例，Health MCP、Drug MCP 和 Review API 启动；Milvus `19530` 未监听。
-- 可见症状：Drug MCP 初始化 collection 时连接失败，5 个 case 各在约 120 秒超时，模型未被调用。
-- 机器码：原始 runner 记录 `UNEXPECTED_ONLINE_ERROR`；复盘后归一化为 `DEPENDENCY_TIMEOUT`，依赖原因为 `MILVUS_UNAVAILABLE`。
+- 输入条件：2026-09-05 第一次本机在线五例中 Milvus `19530` 未监听；启动 Docker 中的 Milvus、Neo4j、etcd 和 MinIO 后原样重跑。
+- 可见症状：第一次在 Milvus collection 初始化失败；第二次已连接 Milvus/Neo4j，首个 MCP session 能正常完成初始化和工具调用，但 session 关闭时执行 `finalize_storages()`。后续 session 复用同一个 `rag` 对象时 `_driver` 已为空，5 个 case 仍各在约 120 秒超时。第一例记录了一次 `MODEL_UPSTREAM_ERROR` fallback；独立最小探针也返回 `APIConnectionError/httpx.ReadError`，没有成功模型调用。
+- 机器码：runner 记录 `DEPENDENCY_TIMEOUT`；公开摘要中的依赖原因为 `MCP_SESSION_STORAGE_LIFECYCLE_MISMATCH`。
 - 安全行为：在线验收 `false`、task completion/metrics coverage 为 0；没有生成 Finding 结论，没有写回，也没有用 Fixture 替换结果。
 - 回归测试：`tests/test_online_evaluation.py::test_online_runner_labels_dependency_timeouts` 和 launcher 失败报告/进程清理契约。
-- 状态：环境限制仍存在。恢复 Milvus 后必须重跑五例，不能把当前报告改写为成功。
+- 状态：Drug MCP 的 session/storage 生命周期限制仍存在，本项目按约束不修改 Drug MCP；生命周期统一且模型端点恢复后必须重跑五例，不能把当前报告改写为成功。
 
 ## 失败 3：陈旧版本和写回冲突
 
@@ -40,6 +40,7 @@
 
 ## 没有被美化的结果
 
-离线 15/15 只能说明确定性规则与 Fixture 合同回归通过。真实在线 0/5 表明当前机器未满足
-Milvus 运行前提，因此无法声称真实模型、完整数据库链路、在线延迟或在线写回达到阈值。公开
-摘要保留两者，面试演示可以用 Fixture 展示交互，但必须同步说明在线失败证据。
+离线 15/15 只能说明确定性规则与 Fixture 合同回归通过。真实在线 0/5 表明当前 Drug MCP
+的 MCP/LightRAG 生命周期未闭合且模型端点不可用，因此无法声称真实模型、完整数据库链路、在线延迟或
+在线写回达到阈值。公开摘要保留两者，面试演示可以用 Fixture 展示交互，但必须同步说明在线
+失败证据。

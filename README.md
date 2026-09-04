@@ -134,7 +134,8 @@ powershell -ExecutionPolicy Bypass -File scripts/run-live-evaluation.ps1
 
 在线 launcher 创建 `artifacts/live-runs/<timestamp>`，复制并播种隔离 Health 数据库，只传递
 `AGENT_MODEL_ENV_PATH` 而不读取或打印密钥，只停止自身启动的进程。`-CommitSynthetic` 会
-提交两次验证幂等，并校验源数据库哈希和修改时间不变。
+提交两次验证幂等，并校验源数据库哈希和修改时间不变。preview 与 commit 两种模式都会在
+启动前拒绝已占用的 8000、8010、8011、8020、8021 端口，避免误用其他进程的服务。
 
 ## 结果：离线与在线
 
@@ -142,9 +143,12 @@ powershell -ExecutionPolicy Bypass -File scripts/run-live-evaluation.ps1
 information recall 和 task completion 均为 1.0。它使用 `FixtureHealthGateway`、
 `FixtureDrugGateway` 与 `DeterministicPlanner`，不能代表线上质量或延迟。
 
-真实在线运行：5 个 case 全部发起，但本机 Milvus `19530` 不可用，5/5 在 Drug MCP 的
-LightRAG 初始化路径超时，完成率和指标覆盖率均为 0，未达到验收阈值；模型未被调用，
-也没有发生写回。这个失败被保留为当前环境基线，没有用 Fixture 结果替代。
+真实在线运行：5 个 case 全部发起。第一次运行暴露 Milvus `19530` 未启动；启动 Docker
+中的 Milvus、Neo4j、etcd 和 MinIO 后再次运行，Drug MCP 已连接两个数据库，但
+首个 MCP session 关闭时会 finalize 共享 LightRAG；后续 session 复用该对象时 `_driver`
+已经为空，5/5 最终以 `DEPENDENCY_TIMEOUT` 失败。完成率和指标覆盖率均为 0；第一例记录了
+一次模型上游失败并回退，最小直连探针同样返回 `APIConnectionError`，因此没有成功模型调用，
+也没有发生写回。真实失败始终保留，没有用 Fixture 结果替代。
 
 可公开结果：[离线摘要](docs/portfolio/results/offline-regression-summary.json) ·
 [在线摘要](docs/portfolio/results/online-integration-summary.json) ·
@@ -159,8 +163,10 @@ LightRAG 初始化路径超时，完成率和指标覆盖率均为 0，未达到
 ## 关键取舍与失败案例
 
 核心取舍是“规则控制安全和写回，模型只处理适合语义判断的部分”；报告只是 ReviewState
-投影，不是主业务。已观察并记录模型 schema 降级、Milvus 不可用和 stale version/写回冲突，
-每个案例都包含失败码、安全行为和回归测试，见[取舍与失败复盘](docs/portfolio/tradeoffs-and-failures.md)。
+投影，不是主业务。已观察并记录模型 schema/上游降级、Milvus 启动失败和 MCP/LightRAG
+生命周期不匹配，
+以及 stale version/写回冲突；每个案例都包含失败码、安全行为和回归测试，见
+[取舍与失败复盘](docs/portfolio/tradeoffs-and-failures.md)。
 
 ## 医疗、数据和部署边界
 
@@ -173,7 +179,7 @@ MedicationRequest 始终称为“活动用药医嘱”，不声称患者实际�
 
 ## 后续演进条件
 
-- Milvus 恢复后重跑五例在线评测，目标完成率至少 80%、安全零容忍指标全部为 0、指标覆盖率 100%。
+- 统一 Drug MCP session 与 LightRAG storage 生命周期、恢复模型端点后重跑五例在线评测；目标完成率至少 80%、安全零容忍指标全部为 0、指标覆盖率 100%。
 - 用独立临床标注集验证缺失信息 recall，再讨论生产阈值和告警。
 - 多 worker 前把 mutation lock、checkpoint lease 和幂等协调迁移到共享基础设施。
 - 只有新增相互作用库/指南等独立知识域，或单患者十种以上用药造成可测延迟瓶颈时，才拆分多 Agent。

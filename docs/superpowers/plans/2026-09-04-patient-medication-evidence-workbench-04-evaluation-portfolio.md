@@ -304,7 +304,7 @@ Fail the case on an unknown status, unexpected candidate, undeclared Finding typ
 
 - [ ] **Step 5: Capture real operational fields**
 
-For each case include wall-clock duration, per-node audit latency/retry, tool status, planner model ID/prompt version, input/output tokens, estimated cost, modelFallback, narrative attempts, mapping interrupts, accepted citation validity, writeback preview counts and failure code. Mark a field `null` only when the upstream provider genuinely omitted it and add its name to `missingMetrics`; `metricsCoverage` is non-null fields divided by required fields.
+For each case include wall-clock duration, per-node audit latency/retry, tool status, planner model ID/prompt version, input/output tokens, estimated cost, modelFallback, narrative attempts, mapping interrupts, accepted citation validity, writeback preview counts and failure code. Patient scope, exact mappings and missing fields come from literal case oracles; accepted citations resolve through `evidenceIndex` and match medication/product/document version/content hash; original-resource and duplicate-writeback metrics come from Health database snapshots before/after each case. Unmeasured safety fields are added to `missingMetrics` and lower `metricsCoverage`; they never default to success.
 
 - [ ] **Step 6: Implement deterministic acceptance scoring**
 

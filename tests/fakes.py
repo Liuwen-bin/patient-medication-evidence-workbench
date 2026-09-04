@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +48,7 @@ class FakeHealthGateway:
         self.response = response
         self.calls: list[tuple[str | None, str | None]] = []
         self.validate_calls: list[dict[str, Any]] = []
-        self.commit_calls: list[tuple[str, str, int, bool]] = []
+        self.commit_calls: list[tuple[str, str, int, bool, str]] = []
 
     async def get_review_context(self, patient_id: str | None, as_of: str | None) -> TimedToolResult:
         self.calls.append((patient_id, as_of))
@@ -74,8 +74,11 @@ class FakeHealthGateway:
 
     async def commit_writeback(
         self, job_id: str, bundle_hash: str, expected_version: int, confirmed: bool,
+        reviewer_id: str,
     ) -> TimedToolResult:
-        self.commit_calls.append((job_id, bundle_hash, expected_version, confirmed))
+        self.commit_calls.append(
+            (job_id, bundle_hash, expected_version, confirmed, reviewer_id)
+        )
         return envelope("OK", {
             "jobId": job_id,
             "committed": True,

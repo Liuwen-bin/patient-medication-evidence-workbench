@@ -3,7 +3,8 @@ param(
     [string]$HealthRoot = "C:\Users\Administrator\Desktop\mcp\health-record-mcp\Agent",
     [string]$DrugRoot = "C:\Users\Administrator\Downloads\dm_spl_release_homeopathic\homeopathic\dailymed_lightrag",
     [string]$ModelEnvPath = "C:\Users\Administrator\Downloads\dm_spl_release_homeopathic\homeopathic\LightRAG\.env",
-    [switch]$CommitSynthetic
+    [switch]$CommitSynthetic,
+    [switch]$CheckPortsOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,8 +16,11 @@ $canonicalReport = Join-Path $reviewRoot "artifacts/evaluation/online-integratio
 $runReport = Join-Path $runDirectory "online-integration-report.json"
 $sourceHealthDb = Join-Path $HealthRoot "data/chinese-demo-record.sqlite"
 $evaluationHealthDb = Join-Path $runDirectory "health-eval.sqlite"
+$ragFaultAttestation = Join-Path $runDirectory "rag-fault-attestation.json"
 $startedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $priorMilvusUri = $env:MILVUS_URI
+$sourceHashBefore = $null
+$sourceTimestampBefore = $null
 
 function Write-FailureReport {
     param([string]$Code, [string]$Stage, [string]$ExceptionType)
@@ -95,6 +99,16 @@ function Wait-TcpPort {
     throw [System.TimeoutException]::new("$ServiceName did not become ready on its expected port.")
 }
 
+function Assert-LiveEvaluationPortsAvailable {
+    foreach ($port in @(8000, 8010, 8020, 8011, 8021)) {
+        if (Test-TcpPort -Port $port) {
+            throw [System.InvalidOperationException]::new(
+                "Port $port is already owned; live evaluation requires isolated services."
+            )
+        }
+    }
+}
+
 function Start-OwnedProcess {
     param(
         [string]$Name,
@@ -111,6 +125,17 @@ function Start-OwnedProcess {
     return $process
 }
 
+if ($CheckPortsOnly) {
+    try {
+        Assert-LiveEvaluationPortsAvailable
+        exit 0
+    }
+    catch {
+        Write-Error $_.Exception.Message
+        exit 1
+    }
+}
+
 New-Item -ItemType Directory -Force $runDirectory | Out-Null
 $stage = "validate_inputs"
 try {
@@ -119,6 +144,8 @@ try {
             throw [System.IO.FileNotFoundException]::new("A required live-evaluation path is unavailable.")
         }
     }
+    $stage = "validate_ports"
+    Assert-LiveEvaluationPortsAvailable
     $sourceHashBefore = (Get-FileHash -LiteralPath $sourceHealthDb -Algorithm SHA256).Hash
     $sourceTimestampBefore = (Get-Item -LiteralPath $sourceHealthDb).LastWriteTimeUtc
 
@@ -149,41 +176,40 @@ try {
     $env:PYTHONPATH = "$reviewRoot\src;$DrugRoot\src;$($env:PYTHONPATH)"
 
     $stage = "start_health_mcp"
-    if (-not (Test-TcpPort -Port 8000)) {
-        Start-OwnedProcess -Name "health-mcp" -WorkingDirectory $HealthRoot `
-            -Arguments @("mcp/mcp_server.py", "--transport", "http", "--host", "127.0.0.1", "--port", "8000") | Out-Null
-        Wait-TcpPort -Port 8000 -ServiceName "Health MCP"
-    }
-    elseif ($CommitSynthetic) {
-        throw [System.InvalidOperationException]::new("Port 8000 is already owned; isolated commit cannot be attested.")
-    }
+    Start-OwnedProcess -Name "health-mcp" -WorkingDirectory $HealthRoot `
+        -Arguments @("mcp/mcp_server.py", "--transport", "http", "--host", "127.0.0.1", "--port", "8000") | Out-Null
+    Wait-TcpPort -Port 8000 -ServiceName "Health MCP"
 
     $stage = "start_drug_mcp"
-    if (-not (Test-TcpPort -Port 8010)) {
-        Start-OwnedProcess -Name "drug-mcp" -WorkingDirectory $DrugRoot `
-            -Arguments @("-m", "dailymed_lightrag.drug_mcp_server", "--transport", "http", "--host", "127.0.0.1", "--port", "8010") | Out-Null
-        Wait-TcpPort -Port 8010 -ServiceName "Drug MCP"
-    }
+    Start-OwnedProcess -Name "drug-mcp" -WorkingDirectory $DrugRoot `
+        -Arguments @("-m", "dailymed_lightrag.drug_mcp_server", "--transport", "http", "--host", "127.0.0.1", "--port", "8010") | Out-Null
+    Wait-TcpPort -Port 8010 -ServiceName "Drug MCP"
 
     $stage = "start_review_api"
-    if (-not (Test-TcpPort -Port 8020)) {
-        Start-OwnedProcess -Name "review-api" -WorkingDirectory $reviewRoot `
-            -Arguments @("-c", '"from medication_review_agent.api import main; main()"') | Out-Null
-        Wait-TcpPort -Port 8020 -ServiceName "Review API"
-    }
-    elseif ($CommitSynthetic) {
-        throw [System.InvalidOperationException]::new("Port 8020 is already owned; isolated commit cannot be attested.")
-    }
+    Start-OwnedProcess -Name "review-api" -WorkingDirectory $reviewRoot `
+        -Arguments @("-c", '"from medication_review_agent.api import main; main()"') | Out-Null
+    Wait-TcpPort -Port 8020 -ServiceName "Review API"
     $health = Invoke-RestMethod -Uri "http://127.0.0.1:8020/api/health" -TimeoutSec 5
     if ($health.status -ne "healthy") {
         throw [System.InvalidOperationException]::new("Review API health contract failed.")
     }
 
     $stage = "start_degraded_profile"
-    if ((Test-TcpPort -Port 8011) -or (Test-TcpPort -Port 8021)) {
-        throw [System.InvalidOperationException]::new("Degraded profile ports are already owned.")
+    $ragFaultPort = 65534
+    $ragFaultUri = "http://127.0.0.1:$ragFaultPort"
+    if (Test-TcpPort -Port $ragFaultPort) {
+        throw [System.InvalidOperationException]::new(
+            "The fixed Milvus fault endpoint is unexpectedly reachable."
+        )
     }
-    $env:MILVUS_URI = "http://127.0.0.1:65534"
+    [ordered]@{
+        profile = "rag-unavailable"
+        dependency = "milvus"
+        fault = "endpoint_unreachable"
+        configuredEndpoint = $ragFaultUri
+        observedUnavailable = $true
+    } | ConvertTo-Json | Set-Content -LiteralPath $ragFaultAttestation -Encoding UTF8
+    $env:MILVUS_URI = $ragFaultUri
     Start-OwnedProcess -Name "drug-mcp-rag-unavailable" -WorkingDirectory $DrugRoot `
         -Arguments @("-m", "dailymed_lightrag.drug_mcp_server", "--transport", "http", "--host", "127.0.0.1", "--port", "8011") | Out-Null
     Wait-TcpPort -Port 8011 -ServiceName "Degraded Drug MCP"
@@ -212,7 +238,9 @@ try {
         "--base-url", "http://127.0.0.1:8020",
         "--rag-unavailable-base-url", "http://127.0.0.1:8021",
         "--api-key", $env:REVIEW_API_KEY,
-        "--reviewer-id", $env:REVIEW_API_REVIEWER_ID
+        "--reviewer-id", $env:REVIEW_API_REVIEWER_ID,
+        "--health-db-path", $evaluationHealthDb,
+        "--profile-attestation", $ragFaultAttestation
     )
     if ($CommitSynthetic) {
         $arguments += "--commit-synthetic"
@@ -224,23 +252,10 @@ try {
     }
     New-Item -ItemType Directory -Force (Split-Path $canonicalReport -Parent) | Out-Null
     Copy-Item -LiteralPath $runReport -Destination $canonicalReport -Force
-    $stage = "verify_source_database"
-    $sourceHashAfter = (Get-FileHash -LiteralPath $sourceHealthDb -Algorithm SHA256).Hash
-    $sourceTimestampAfter = (Get-Item -LiteralPath $sourceHealthDb).LastWriteTimeUtc
-    if ($sourceHashAfter -ne $sourceHashBefore -or $sourceTimestampAfter -ne $sourceTimestampBefore) {
-        Write-FailureReport -Code "SOURCE_DATABASE_CHANGED" -Stage $stage `
-            -ExceptionType "SourceDatabaseIntegrityError"
-        exit 1
-    }
     exit $runnerExitCode
 }
 catch {
-    $failureCode = if ($stage -eq "verify_source_database") {
-        "SOURCE_DATABASE_CHANGED"
-    } else {
-        "DEPENDENCY_START_FAILED"
-    }
-    Write-FailureReport -Code $failureCode -Stage $stage `
+    Write-FailureReport -Code "DEPENDENCY_START_FAILED" -Stage $stage `
         -ExceptionType $_.Exception.GetType().Name
     Write-Error "Online evaluation failed during '$stage'. See the sanitized report."
     exit 1
@@ -254,6 +269,26 @@ finally {
     foreach ($process in $startedProcesses) {
         if (-not $process.HasExited) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($null -ne $sourceHashBefore) {
+        $sourceDatabaseChanged = $false
+        try {
+            $sourceHashAfter = (Get-FileHash -LiteralPath $sourceHealthDb -Algorithm SHA256).Hash
+            $sourceTimestampAfter = (Get-Item -LiteralPath $sourceHealthDb).LastWriteTimeUtc
+            $sourceDatabaseChanged = (
+                $sourceHashAfter -ne $sourceHashBefore -or
+                $sourceTimestampAfter -ne $sourceTimestampBefore
+            )
+        }
+        catch {
+            $sourceDatabaseChanged = $true
+        }
+        if ($sourceDatabaseChanged) {
+            Write-FailureReport -Code "SOURCE_DATABASE_CHANGED" `
+                -Stage "verify_source_database" `
+                -ExceptionType "SourceDatabaseIntegrityError"
+            exit 1
         }
     }
 }

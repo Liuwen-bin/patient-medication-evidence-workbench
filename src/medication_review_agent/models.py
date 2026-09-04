@@ -47,6 +47,11 @@ class ReviewTopic(str, Enum):
     IMAGES = "images"
 
 
+UNRESOLVED_FINDING_TYPES = frozenset(
+    {"EVIDENCE_GAP", "PRODUCT_UNMAPPED", "LABEL_EVIDENCE_MISSING"}
+)
+
+
 class ReviewIntent(ContractModel):
     type: Literal["MEDICATION_EVIDENCE_REVIEW"] = "MEDICATION_EVIDENCE_REVIEW"
     topics: list[ReviewTopic]
@@ -213,7 +218,10 @@ class Finding(ContractModel):
 
     @model_validator(mode="after")
     def accepted_findings_need_evidence(self) -> "Finding":
-        if self.status != FindingStatus.ACCEPTED or self.reviewType == "EVIDENCE_GAP":
+        if (
+            self.status != FindingStatus.ACCEPTED
+            or self.reviewType in UNRESOLVED_FINDING_TYPES
+        ):
             return self
         if not self.patientEvidenceRefs or not self.labelEvidenceRefs:
             raise ValueError("accepted findings require patient and label evidence")

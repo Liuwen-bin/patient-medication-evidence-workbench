@@ -17,7 +17,7 @@ from .gateways import DrugEvidenceGateway, HealthRecordGateway, TimedToolResult,
 from .models import (
     EvidenceItem, Finding, FindingStatus, GraphEvidenceProvenance, HumanDecision,
     MedicationMapping, MedicationRecord, ReviewIntent, ReviewPlanItem, ReviewSnapshot,
-    ReviewStatus, ReviewTopic, migrate_finding_payload,
+    ReviewStatus, ReviewTopic, UNRESOLVED_FINDING_TYPES, migrate_finding_payload,
 )
 from .planner import DeterministicPlanner, ReviewPlanner
 from .repository import ReviewRepository
@@ -29,11 +29,11 @@ from .retrieval import (
     stable_evidence_id,
 )
 from .safety import evaluate_review_question
-from .verifier import apply_verification
+from .verifier import apply_verification, verify_label_evidence_bindings
 from .workflow_state import (
     CompleteFindingReview,
     FinalSignOff,
-    FindingDecision,
+    FindingDecision as FindingDecision,
     MappingConfirmation,
     PatientConfirmation,
     ReviewState,
@@ -98,6 +98,27 @@ def _document_versions(result: TimedToolResult) -> dict[str, str]:
     return versions
 
 
+def _document_identities(
+    result: TimedToolResult,
+) -> frozenset[tuple[str, str, str]]:
+    product = result.envelope.data.get("product") or {}
+    if not isinstance(product, dict):
+        return frozenset()
+    documents = [product, *(product.get("documents") or [])]
+    return frozenset(
+        (
+            str(document["documentId"]),
+            str(document["documentVersion"]),
+            str(document["contentHash"]),
+        )
+        for document in documents
+        if isinstance(document, dict)
+        and all(document.get(field) for field in (
+            "documentId", "documentVersion", "contentHash",
+        ))
+    )
+
+
 def _facts_match_product(result: TimedToolResult, product_id: str) -> bool:
     product = result.envelope.data.get("product")
     return isinstance(product, dict) and product.get("productId") == product_id
@@ -131,6 +152,8 @@ def _fact_evidence(
         sourcePath=product.get("sourcePath"),
         contentHash=product.get("contentHash"),
         graphProvenance=_graph_provenance(result),
+        activeIngredients=product.get("activeIngredients") or [],
+        inactiveIngredients=product.get("inactiveIngredients") or [],
     )
 
 
@@ -239,12 +262,35 @@ def _label_evidence_bindings(
     product_ids: set[str],
     *,
     sources: frozenset[str] = frozenset({"SPL"}),
+    topics: frozenset[str] | None = None,
+    document_identities: dict[str, frozenset[tuple[str, str, str]]] | None = None,
 ) -> tuple[list[str], list[str]]:
+    def matches_current_document(item: dict[str, Any]) -> bool:
+        if document_identities is None:
+            return True
+        identity = (
+            str(item.get("documentId") or ""),
+            str(item.get("documentVersion") or ""),
+            str(item.get("contentHash") or ""),
+        )
+        claimed_products = set(item.get("productIds", []))
+        return (
+            bool(identity[0] and identity[1] and identity[2])
+            and bool(claimed_products)
+            and claimed_products <= product_ids
+            and all(
+            identity in document_identities.get(product_id, frozenset())
+                for product_id in claimed_products
+            )
+        )
+
     relevant = [
         item for item in evidence_index
         if item.get("source") in sources
         and product_ids.intersection(item.get("productIds", []))
         and str(item.get("evidenceRef", "")).startswith("SPL:")
+        and (topics is None or item.get("topic") in topics)
+        and matches_current_document(item)
     ]
     return (
         list(dict.fromkeys(item["evidenceRef"] for item in relevant)),
@@ -296,14 +342,27 @@ def deidentified_patient_features(context: dict[str, Any]) -> dict[str, Any]:
         value = item.get("substance") or item.get("name")
         if isinstance(value, str) and value.strip():
             allergy_terms.add(value.strip())
+    special_population_flags: set[str] = set()
+    for item in context.get("specialPopulations") or []:
+        if isinstance(item, str) and item.strip():
+            special_population_flags.add(item.strip())
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        value = item.get("value")
+        name_text = name.strip() if isinstance(name, str) else ""
+        value_text = value.strip() if isinstance(value, str) else ""
+        if name_text and value_text:
+            special_population_flags.add(f"{name_text}: {value_text}")
+        elif value_text:
+            special_population_flags.add(value_text)
+        elif name_text:
+            special_population_flags.add(name_text)
     return {
         "ageBand": age_band,
         "allergyTerms": sorted(allergy_terms),
-        "specialPopulationFlags": sorted(
-            item.strip()
-            for item in context.get("specialPopulations") or []
-            if isinstance(item, str) and item.strip()
-        ),
+        "specialPopulationFlags": sorted(special_population_flags),
     }
 
 
@@ -1148,13 +1207,22 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             missingField=missing_field,
         ).model_dump(mode="json") for missing_field in planned_missing_fields]
         for gap in [item for item in state.get("unresolvedItems", []) if item.get("kind") == "EVIDENCE_GAP"]:
+            review_type = (
+                "LABEL_EVIDENCE_MISSING"
+                if gap.get("sourceTool") == "search_label_evidence"
+                else "EVIDENCE_GAP"
+            )
             findings.append(make_finding(
-                rule_id="drug-evidence-gap-v1",
+                rule_id=(
+                    "label-evidence-missing-v1"
+                    if review_type == "LABEL_EVIDENCE_MISSING"
+                    else "drug-evidence-gap-v1"
+                ),
                 comparison_inputs={
                     "sourceTool": gap.get("sourceTool"),
                     "productIds": sorted(gap.get("productIds", [])),
                 },
-                findingId=str(uuid4()), reviewType="EVIDENCE_GAP",
+                findingId=str(uuid4()), reviewType=review_type,
                 summary=str(gap.get("summary") or "Drug evidence is insufficient."),
                 attentionLevel="HIGH", confidence=1.0,
                 selectedProductIds=gap.get("productIds", []),
@@ -1208,7 +1276,7 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                 findings.append(make_finding(
                     rule_id="unmapped-medication-v1",
                     comparison_inputs={"medicationId": mapping.medicationId},
-                    findingId=str(uuid4()), reviewType="EVIDENCE_GAP",
+                    findingId=str(uuid4()), reviewType="PRODUCT_UNMAPPED",
                     summary=f"No DailyMed product was mapped for {mapping.sourceName}.",
                     attentionLevel="HIGH", confidence=1.0, medicationIds=[mapping.medicationId],
                     patientEvidenceRefs=medication.patientEvidenceRefs,
@@ -1235,6 +1303,77 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                 requiresHumanReview=True, verificationWarnings=warnings,
                 graphProvenance=finding_provenance,
             ).model_dump(mode="json"))
+            planned_topics = {
+                str(topic)
+                for item in state.get("reviewPlan", [])
+                for topic in item.get("topics", [])
+            }
+            if "ingredients" in planned_topics:
+                ingredient_label_refs, ingredient_label_ids = (
+                    _label_evidence_bindings(
+                        relevant_evidence,
+                        {mapping.selectedProductId},
+                        topics=frozenset({"ingredients"}),
+                    )
+                )
+                allergies = [
+                    item for item in (state.get("contextSnapshot") or {}).get("allergies", [])
+                    if isinstance(item, dict)
+                    and _normalized_text(item.get("substance") or item.get("name"))
+                ]
+                ingredients = [
+                    ingredient
+                    for evidence_item in relevant_evidence
+                    if evidence_item.get("topic") == "product_facts"
+                    for ingredient in [
+                        *(evidence_item.get("activeIngredients") or []),
+                        *(evidence_item.get("inactiveIngredients") or []),
+                    ]
+                    if isinstance(ingredient, dict)
+                    and _normalized_text(ingredient.get("name"))
+                ]
+                observed_matches: set[tuple[str, str]] = set()
+                for allergy in allergies:
+                    allergy_name = _normalized_text(
+                        allergy.get("substance") or allergy.get("name")
+                    )
+                    for ingredient in ingredients:
+                        ingredient_name = _normalized_text(ingredient.get("name"))
+                        ingredient_id = str(ingredient.get("entityId") or "")
+                        identity = (str(allergy.get("evidenceRef") or ""), ingredient_id)
+                        if (
+                            allergy_name != ingredient_name
+                            or identity in observed_matches
+                        ):
+                            continue
+                        observed_matches.add(identity)
+                        findings.append(make_finding(
+                            rule_id="ingredient-allergy-name-match-v1",
+                            normalization_version="normalization-v1",
+                            comparison_inputs={
+                                "allergyName": allergy_name,
+                                "ingredientName": ingredient_name,
+                                "ingredientId": ingredient_id,
+                            },
+                            findingId=str(uuid4()),
+                            reviewType="INGREDIENT_ALLERGY_NAME_MATCH",
+                            summary=(
+                                "Allergy name and product ingredient normalize to "
+                                f"the same term: {allergy_name}."
+                            ),
+                            attentionLevel="HIGH",
+                            confidence=1.0,
+                            medicationIds=[mapping.medicationId],
+                            selectedProductIds=[mapping.selectedProductId],
+                            patientEvidenceRefs=sorted({
+                                *medication.patientEvidenceRefs,
+                                str(allergy.get("evidenceRef") or ""),
+                            } - {""}),
+                            labelEvidenceRefs=ingredient_label_refs,
+                            labelEvidenceIds=ingredient_label_ids,
+                            requiresHumanReview=True,
+                            graphProvenance=finding_provenance,
+                        ).model_dump(mode="json"))
             if warnings:
                 findings.append(make_finding(
                     rule_id="graph-provenance-review-v1",
@@ -1249,6 +1388,11 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
         for comparison in [item for item in state.get("evidenceIndex", []) if item.get("source") == "SPL-GRAPH" and item.get("topic") == "shared_active_ingredients"]:
             provenance = comparison.get("graphProvenance")
             shared_ingredients = comparison.get("sharedActiveIngredients", [])
+            label_refs, label_ids = _label_evidence_bindings(
+                state.get("evidenceIndex", []),
+                set(comparison.get("productIds", [])),
+                topics=frozenset({"ingredients"}),
+            )
             findings.append(make_finding(
                 rule_id="shared-active-ingredient-v1",
                 normalization_version="normalization-v1",
@@ -1266,8 +1410,8 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                 medicationIds=list(medications),
                 selectedProductIds=comparison.get("productIds", []),
                 patientEvidenceRefs=[ref for item in medications.values() for ref in item.patientEvidenceRefs],
-                labelEvidenceRefs=[comparison["evidenceRef"]] if str(comparison.get("evidenceRef", "")).startswith("SPL:") else [],
-                labelEvidenceIds=[comparison["evidenceId"]] if comparison.get("evidenceId") else [],
+                labelEvidenceRefs=label_refs,
+                labelEvidenceIds=label_ids,
                 requiresHumanReview=True, graphProvenance=provenance,
                 sharedActiveIngredients=shared_ingredients,
             ).model_dump(mode="json"))
@@ -1535,9 +1679,10 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
         ]
         refreshed_evidence: list[dict[str, Any]] = []
         refreshed_gaps: list[dict[str, Any]] = []
+        current_document_identities: dict[
+            str, frozenset[tuple[str, str, str]]
+        ] = {}
         comparison_provenance: dict[str, GraphEvidenceProvenance | None] = {}
-        comparison_references: dict[str, list[str]] = {}
-        comparison_evidence_ids: dict[str, list[str]] = {}
         stale_gap_ids = {
             gap_id
             for target_id in canonical_ids
@@ -1594,6 +1739,7 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                 refreshed_evidence.append(
                     _fact_evidence(product_id, facts).model_dump(mode="json")
                 )
+                current_document_identities[product_id] = _document_identities(facts)
             else:
                 return {
                     "status": ReviewStatus.BLOCKED_TOOL_ERROR.value,
@@ -1827,6 +1973,7 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                     if isinstance(item, dict) and item.get("entityId")
                 ),
             }
+            current["selectedProductIds"] = sorted(set(product_ids))
             current["medicationIds"] = list(target.get("medicationIds") or [
                 mapping["medicationId"] for mapping in state.get("medicationMappings", [])
                 if mapping.get("selectedProductId") in product_ids
@@ -1838,9 +1985,6 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             ]
             current["sharedActiveIngredients"] = shared
             comparison_provenance[target_id] = comparison.envelope.graph_provenance
-            comparison_references[target_id] = [
-                ref for ref in comparison.envelope.evidenceRefs if ref.startswith("SPL:")
-            ]
             if not shared:
                 current["status"] = FindingStatus.REJECTED.value
                 current["summary"] = "Resolved: refreshed comparison found no shared active ingredient."
@@ -1862,17 +2006,6 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                     ), "SPL-GRAPH:ingredient-comparison"),
                 ).model_dump(mode="json")
                 refreshed_evidence.append(comparison_evidence)
-                reference = comparison_evidence["evidenceRef"]
-                if reference.startswith("SPL:"):
-                    comparison_evidence_ids[target_id] = [
-                        comparison_evidence["evidenceId"]
-                    ]
-                    current["labelEvidenceRefs"] = [reference]
-                    current["labelEvidenceIds"] = comparison_evidence_ids[target_id]
-                else:
-                    comparison_evidence_ids[target_id] = []
-                    current["labelEvidenceRefs"] = []
-                    current["labelEvidenceIds"] = []
                 current["graphProvenance"] = _graph_provenance(comparison)
         evidence_index = _upsert_evidence([
             *retained_evidence,
@@ -1883,25 +2016,28 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             if item.get("findingId") not in requested_ids:
                 continue
             product_ids = set(item.get("selectedProductIds", []))
-            item["labelEvidenceRefs"] = [
-                evidence["evidenceRef"] for evidence in refreshed_evidence
-                if evidence.get("source") == "SPL"
-                and product_ids.intersection(evidence.get("productIds", []))
-                and str(evidence.get("evidenceRef", "")).startswith("SPL:")
-            ]
-            item["labelEvidenceRefs"] = list(dict.fromkeys([
-                *item["labelEvidenceRefs"], *comparison_references.get(item["findingId"], []),
-            ]))
-            item["labelEvidenceIds"] = list(dict.fromkeys([
-                evidence["evidenceId"] for evidence in refreshed_evidence
-                if evidence.get("source") == "SPL"
-                and evidence.get("evidenceId")
-                and product_ids.intersection(evidence.get("productIds", []))
-            ]))
-            item["labelEvidenceIds"] = list(dict.fromkeys([
-                *item["labelEvidenceIds"],
-                *comparison_evidence_ids.get(item["findingId"], []),
-            ]))
+            binding_source = refreshed_evidence
+            label_refs, label_ids = _label_evidence_bindings(
+                binding_source,
+                product_ids,
+                topics=(
+                    frozenset({"ingredients"})
+                    if item.get("reviewType") == "DUPLICATE_ACTIVE_INGREDIENT"
+                    else None
+                ),
+            )
+            if (
+                item.get("reviewType") == "DUPLICATE_ACTIVE_INGREDIENT"
+                and not label_ids
+            ):
+                label_refs, label_ids = _label_evidence_bindings(
+                    evidence_index,
+                    product_ids,
+                    topics=frozenset({"ingredients"}),
+                    document_identities=current_document_identities,
+                )
+            item["labelEvidenceRefs"] = label_refs
+            item["labelEvidenceIds"] = label_ids
             if item["findingId"] not in resolved_comparison_ids and "comparison_evidence_insufficient" not in item.get("verificationErrors", []):
                 item["status"] = FindingStatus.PENDING.value
             if "comparison_evidence_insufficient" not in item.get("verificationErrors", []):
@@ -1999,7 +2135,12 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             for item in state.get("findings", [])
         ]
         claims = [{
-            "claimId": item["findingId"], "reviewType": item["reviewType"],
+            "claimId": item["findingId"],
+            "reviewType": (
+                "EVIDENCE_GAP"
+                if item["reviewType"] in UNRESOLVED_FINDING_TYPES
+                else item["reviewType"]
+            ),
             "ruleId": item["ruleId"],
             "normalizationVersion": item.get("normalizationVersion"),
             "comparisonInputs": item.get("comparisonInputs", {}),
@@ -2020,11 +2161,24 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             if item.get("status") == FindingStatus.REJECTED.value:
                 verified_findings.append(item)
                 continue
-            verified_findings.append(apply_verification(
-                Finding.model_validate(item),
+            finding = Finding.model_validate(item)
+            remote_errors = (
                 remote.get(item["findingId"], {}).get("errors", [])
                 if item["findingId"] in remote
-                else ([] if item["reviewType"] == "EVIDENCE_GAP" else ["remote_validation_incomplete"]),
+                else (
+                    []
+                    if item["reviewType"] in UNRESOLVED_FINDING_TYPES
+                    else ["remote_validation_incomplete"]
+                )
+            )
+            verified_findings.append(apply_verification(
+                finding,
+                [
+                    *remote_errors,
+                    *verify_label_evidence_bindings(
+                        finding, state.get("evidenceIndex", [])
+                    ),
+                ],
             ).model_dump(mode="json"))
         findings = verified_findings
         return {"findings": findings, "status": ReviewStatus.AWAITING_FINDING_REVIEW.value, "metrics": metrics}
@@ -2042,14 +2196,18 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             if selected is None:
                 continue
             if selected.action == "ACCEPT_FINDING":
-                lacks_pair = item["reviewType"] != "EVIDENCE_GAP" and (
+                lacks_pair = item["reviewType"] not in UNRESOLVED_FINDING_TYPES and (
                     not item.get("patientEvidenceRefs") or not item.get("labelEvidenceRefs")
                 )
-                if item.get("verificationErrors") or lacks_pair:
+                binding_errors = verify_label_evidence_bindings(
+                    Finding.model_validate(item), state.get("evidenceIndex", [])
+                )
+                if item.get("verificationErrors") or lacks_pair or binding_errors:
                     item["status"] = FindingStatus.NEEDS_MORE_EVIDENCE.value
                     item["verificationErrors"] = list(dict.fromkeys([
                         *item.get("verificationErrors", []),
                         *(["missing_paired_evidence"] if lacks_pair else []),
+                        *binding_errors,
                     ]))
                 else:
                     item["status"] = FindingStatus.ACCEPTED.value

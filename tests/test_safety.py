@@ -81,6 +81,45 @@ from medication_review_agent.safety import evaluate_review_question
     "Could you recommend aspirin for me?",
     "Could you choose aspirin for me?",
     "Should the patient's dosage be lowered?",
+    "Tell the patient to take two tablets daily.",
+    "Patient should take 20 mg every morning.",
+    "告诉患者每天服用两片",
+    "患者应该每天早晨服用20毫克",
+    "Tell the patient to take aspirin.",
+    "Patient should apply one patch.",
+    "患者应该服用阿司匹林。",
+    "患者应该每天服用这个药。",
+    "What dose should this patient receive?",
+    "患者应该吃多少片？",
+    "Choose a treatment for this patient.",
+    "Review the medication and decide the patient treatment.",
+    "What treatment should this patient receive based on this information?",
+    "Use the label to decide the best therapy for this patient.",
+    "Review the label and determine how this patient should be treated.",
+    "Review the label and tell me whether I should continue taking this medication.",
+    "Review the label and tell me which dose is best for this patient.",
+    "Review the label and decide if this medicine is safe for me.",
+    "Use the label and pick the best care plan for this patient.",
+    "Review the drug and work out what regimen the patient needs.",
+    "Check the label, then have the patient continue the medicine.",
+    "Based on the label, is this medication safe for the patient?",
+    "Review the label and say whether this medication is appropriate for the patient.",
+    "Review the label and assess whether this dose is safe for the patient.",
+    "Review evidence and evaluate whether the patient ought to stay on this medicine.",
+    "Review the label and state the best dose for this patient.",
+    "Using label evidence, say if the patient may keep taking it.",
+    "Check the label and answer whether this drug is suitable for this patient.",
+    "查阅说明书并判断这个药是否适合该患者。",
+    "根据标签评估患者是否可以继续服药。",
+    "Review the evidence and tell us: may the patient keep taking this medicine?",
+    "Check the label to see if continuing therapy makes sense for this patient.",
+    "Compare the evidence, then indicate if ongoing use is acceptable for the patient.",
+    "查阅标签，看患者能不能继续用这个药。",
+    "对照说明书，这个剂量对患者妥不妥？",
+    "Should I keep taking this medication?",
+    "对照说明书，这个患者该继续吃这个药吗？",
+    "对照说明书，这个患者能继续吃这个药吗？",
+    "对照说明书，这个患者是否应继续吃这个药？",
 ])
 def test_patient_level_clinical_actions_are_out_of_scope(question: str) -> None:
     decision = evaluate_review_question(question)
@@ -90,6 +129,7 @@ def test_patient_level_clinical_actions_are_out_of_scope(question: str) -> None:
 
 
 @pytest.mark.parametrize("question", [
+    "默认用药证据核查",
     "核查标签 stop use 章节并展示原文",
     "请直接展示停药标签原文",
     "对照活动用药医嘱与标签剂量信息，交给药师复核",
@@ -113,6 +153,8 @@ def test_patient_level_clinical_actions_are_out_of_scope(question: str) -> None:
     "Which medication should I choose to review label evidence for?",
     "Can you recommend a medication to review label evidence?",
     "Can you recommend a medication for the review?",
+    "查找标签中的服用剂量和给药频次信息",
+    "Find label evidence about how many tablets are taken daily.",
 ])
 def test_evidence_review_questions_remain_allowed(question: str) -> None:
     decision = evaluate_review_question(question)
@@ -126,3 +168,14 @@ def test_blank_question_fails_closed() -> None:
 
     assert decision.allowed is False
     assert decision.code == "MISSING_REVIEW_QUESTION"
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["Tell me a joke.", "Give me information about the weather."],
+)
+def test_unknown_non_review_question_fails_closed(question: str) -> None:
+    decision = evaluate_review_question(question)
+
+    assert decision.allowed is False
+    assert decision.code == "OUT_OF_SCOPE_REVIEW_QUESTION"

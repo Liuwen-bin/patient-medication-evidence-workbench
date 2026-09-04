@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC
 from typing import Any, Protocol
 
 from .gateways import TimedToolResult
-from .models import FindingStatus, ReviewSnapshot, ReviewStatus, WritebackJob
+from .models import (
+    FindingStatus,
+    ReviewSnapshot,
+    ReviewStatus,
+    UNRESOLVED_FINDING_TYPES,
+    WritebackJob,
+)
+from .verifier import verify_label_evidence_bindings
 
 
 class HealthWritebackGateway(Protocol):
@@ -16,6 +24,7 @@ class HealthWritebackGateway(Protocol):
         bundle_hash: str,
         expected_version: int,
         confirmed: bool,
+        reviewer_id: str,
     ) -> TimedToolResult: ...
 
 
@@ -86,9 +95,31 @@ def _project_unresolved(review_id: str, item: dict[str, Any]) -> dict[str, Any]:
     return projected
 
 
+def _sign_off_decision(snapshot: ReviewSnapshot, reviewer_id: str):
+    sign_off = next(
+        (
+            decision
+            for decision in reversed(snapshot.humanDecisions)
+            if decision.action == "SIGN_OFF"
+        ),
+        None,
+    )
+    if sign_off is None:
+        raise WritebackStateError("A signed review must include its sign-off decision.")
+    if sign_off.reviewerId != reviewer_id:
+        raise WritebackStateError(
+            "The writeback requester must match the signed-off reviewer."
+        )
+    if sign_off.occurredAt.utcoffset() is None:
+        raise WritebackStateError("The sign-off timestamp must include a timezone offset.")
+    return sign_off
+
+
 def build_writeback_payload(
     snapshot: ReviewSnapshot, reviewer_id: str
 ) -> dict[str, Any]:
+    sign_off = _sign_off_decision(snapshot, reviewer_id)
+    signed_at = sign_off.occurredAt.astimezone(UTC).isoformat().replace("+00:00", "Z")
     findings = []
     unresolved = [
         _project_unresolved(snapshot.reviewId, dict(item))
@@ -97,12 +128,23 @@ def build_writeback_payload(
     for finding in snapshot.findings:
         if finding.status != FindingStatus.ACCEPTED or finding.verificationErrors:
             continue
-        if finding.reviewType == "EVIDENCE_GAP":
+        if finding.reviewType in UNRESOLVED_FINDING_TYPES:
+            missing_field = getattr(finding, "missingField", None)
+            source_tool = getattr(finding, "sourceTool", None)
             gap = {
                 "kind": (
-                    "LABEL_EVIDENCE_MISSING"
-                    if not finding.labelEvidenceRefs
-                    else "PATIENT_FIELD_MISSING"
+                    finding.reviewType
+                    if finding.reviewType != "EVIDENCE_GAP"
+                    else (
+                        "PATIENT_FIELD_MISSING"
+                        if missing_field
+                        else (
+                            "LABEL_EVIDENCE_MISSING"
+                            if source_tool == "search_label_evidence"
+                            or not finding.labelEvidenceRefs
+                            else "EVIDENCE_GAP"
+                        )
+                    )
                 ),
                 "summary": finding.summary,
                 "medicationIds": finding.medicationIds,
@@ -113,6 +155,10 @@ def build_writeback_payload(
             }
             unresolved.append(_project_unresolved(snapshot.reviewId, gap))
             continue
+        if verify_label_evidence_bindings(finding, snapshot.evidenceIndex):
+            raise WritebackStateError(
+                "Accepted findings must resolve to valid SPL evidence."
+            )
         if not finding.patientEvidenceRefs or not finding.labelEvidenceRefs:
             continue
         findings.append(
@@ -144,7 +190,8 @@ def build_writeback_payload(
         "reviewId": snapshot.reviewId,
         "reviewVersion": snapshot.version,
         "patientRef": _normalize_patient_reference(snapshot.patientRef),
-        "reviewerId": reviewer_id,
+        "reviewerId": sign_off.reviewerId,
+        "signedAt": signed_at,
         "findings": sorted(findings, key=lambda item: item["findingId"]),
         "unresolvedItems": sorted(
             unique_unresolved.values(), key=lambda item: item["unresolvedItemId"]
@@ -199,13 +246,19 @@ class WritebackCoordinator:
         return job
 
     async def commit(
-        self, job: WritebackJob, confirmed: bool
+        self,
+        snapshot: ReviewSnapshot,
+        job: WritebackJob,
+        reviewer_id: str,
+        confirmed: bool,
     ) -> dict[str, Any]:
+        _sign_off_decision(snapshot, reviewer_id)
         result = await self.gateway.commit_writeback(
             job.jobId,
             job.bundleHash,
             job.expectedVersion,
             confirmed,
+            reviewer_id,
         )
         _raise_envelope_error(result)
         data = result.envelope.data

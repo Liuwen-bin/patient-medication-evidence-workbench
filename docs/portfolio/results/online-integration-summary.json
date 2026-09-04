@@ -1,7 +1,7 @@
 {
   "schemaVersion": "1.0",
-  "generatedAt": "2026-09-05T00:14:00+08:00",
-  "gitSha": "d1eed44fce4cbcc2e8b295915a545607db23143d",
+  "generatedAt": "2026-09-04T17:26:11.181165+00:00",
+  "gitSha": "5178a82e37e512413fdbb3abdef0e050a9f8cc1c",
   "execution": {
     "mode": "online_integration",
     "network": true,
@@ -12,8 +12,12 @@
       "healthMcpStarted": true,
       "drugMcpStarted": true,
       "reviewServiceStarted": true,
-      "milvusConnected": false,
-      "modelCalled": false
+      "milvusConnected": true,
+      "neo4jConnected": true,
+      "mcpSessionStorageLifecycleCompatible": false,
+      "modelCalled": true,
+      "modelCallSucceeded": false,
+      "modelFallbackObserved": true
     }
   },
   "thresholds": {
@@ -35,15 +39,16 @@
   "acceptancePassed": false,
   "failure": {
     "code": "DEPENDENCY_TIMEOUT",
-    "dependency": "MILVUS_UNAVAILABLE",
-    "originalRunnerCode": "UNEXPECTED_ONLINE_ERROR",
-    "normalizationAddedAfterRun": true
+    "dependency": "MCP_SESSION_STORAGE_LIFECYCLE_MISMATCH",
+    "detail": "The first MCP session initializes and then finalizes the shared LightRAG storage; later sessions reuse it with no active Neo4j driver",
+    "originalRunnerCode": "DEPENDENCY_TIMEOUT",
+    "normalizationAddedAfterRun": false
   },
   "cases": [
-    {"caseId": "online-single-complete", "passed": false, "durationMs": 120295, "failureCode": "DEPENDENCY_TIMEOUT"},
-    {"caseId": "online-ambiguous-variant", "passed": false, "durationMs": 120266, "failureCode": "DEPENDENCY_TIMEOUT"},
-    {"caseId": "online-allergy-ingredient", "passed": false, "durationMs": 120326, "failureCode": "DEPENDENCY_TIMEOUT"},
-    {"caseId": "online-partial-unmapped", "passed": false, "durationMs": 120349, "failureCode": "DEPENDENCY_TIMEOUT"},
-    {"caseId": "online-evidence-degraded", "passed": false, "durationMs": 120452, "failureCode": "DEPENDENCY_TIMEOUT"}
+    {"caseId": "online-single-complete", "passed": false, "durationMs": 120320, "failureCode": "DEPENDENCY_TIMEOUT"},
+    {"caseId": "online-ambiguous-variant", "passed": false, "durationMs": 120212, "failureCode": "DEPENDENCY_TIMEOUT"},
+    {"caseId": "online-allergy-ingredient", "passed": false, "durationMs": 120211, "failureCode": "DEPENDENCY_TIMEOUT"},
+    {"caseId": "online-partial-unmapped", "passed": false, "durationMs": 120212, "failureCode": "DEPENDENCY_TIMEOUT"},
+    {"caseId": "online-evidence-degraded", "passed": false, "durationMs": 120202, "failureCode": "DEPENDENCY_TIMEOUT"}
   ]
 }

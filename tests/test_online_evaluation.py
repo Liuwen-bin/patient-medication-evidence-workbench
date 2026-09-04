@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -17,10 +18,12 @@ from medication_review_agent.online_evaluation import (
     OnlineMetrics,
     _run_all,
     build_online_report,
+    capture_health_database,
     case_expectations_met,
     load_online_cases,
     write_sanitized_online_report,
 )
+from medication_review_agent.retrieval import stable_evidence_id
 
 
 def _snapshot(status: str, version: int) -> dict:
@@ -172,6 +175,146 @@ def test_online_case_manifest_has_five_stable_cases() -> None:
         "online-partial-unmapped",
         "online-evidence-degraded",
     ]
+    assert all(case.expected.get("patientRef") for case in cases)
+    assert all("productMappings" in case.expected for case in cases)
+    assert all("missingFields" in case.expected for case in cases)
+    assert "INGREDIENT_ALLERGY_NAME_MATCH" in cases[2].findingDecisions
+    assert "PRODUCT_UNMAPPED" in cases[3].findingDecisions
+    assert "LABEL_EVIDENCE_MISSING" in cases[4].findingDecisions
+    assert all(
+        set(case.expected.get("findingTypes") or []) <= set(case.findingDecisions)
+        for case in cases
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_manifest_case_reaches_signoff_and_writeback_preview() -> None:
+    for case in load_online_cases("evaluation/online-cases.jsonl"):
+        observed_mutations: list[dict] = []
+
+        def snapshot(status: str, version: int) -> dict:
+            value = _snapshot(status, version)
+            value["reviewId"] = f"review-{case.caseId}"
+            value["patientRef"] = case.expected["patientRef"]
+            value["contextMissingFields"] = case.expected["missingFields"]
+            value["medicationMappings"] = [
+                {
+                    "medicationId": medication_id,
+                    "matchClass": (
+                        "UNMAPPED" if product_id is None else "EXACT_IDENTIFIER"
+                    ),
+                    "selectedProductId": product_id,
+                }
+                for medication_id, product_id in case.expected["productMappings"].items()
+            ]
+            findings = []
+            for index, (review_type, action) in enumerate(
+                case.findingDecisions.items(), 1
+            ):
+                decided_status = {
+                    "ACCEPT_FINDING": "ACCEPTED",
+                    "REJECT_FINDING": "REJECTED",
+                    "REQUEST_MORE_EVIDENCE": "NEEDS_MORE_EVIDENCE",
+                }[action]
+                findings.append({
+                    "findingId": f"finding-{index}",
+                    "reviewType": review_type,
+                    "status": (
+                        "PENDING"
+                        if status == "AWAITING_FINDING_REVIEW"
+                        else decided_status
+                    ),
+                    "patientEvidenceRefs": [],
+                    "labelEvidenceRefs": [],
+                })
+            value["findings"] = findings
+            value["retrievalAttempts"] = {}
+            if status == "AWAITING_MAPPING_CONFIRMATION":
+                medication_id = next(iter(case.expected["productMappings"]))
+                value["medicationMappings"] = [{
+                    "medicationId": medication_id,
+                    "mappingConfirmationRequired": True,
+                    "candidates": [{
+                        "productId": "DRUG_PRODUCT::10191-1246",
+                        "productCode": "10191-1246",
+                    }],
+                }]
+            return value
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            body = json.loads(request.content or b"{}")
+            if request.method == "POST":
+                observed_mutations.append(body)
+            if path == "/api/reviews":
+                return httpx.Response(201, json=snapshot("CREATED", 0))
+            if path.endswith("/run"):
+                status = (
+                    "AWAITING_MAPPING_CONFIRMATION"
+                    if case.mappingSelection
+                    else "AWAITING_FINDING_REVIEW"
+                )
+                return httpx.Response(200, json=snapshot(status, 1))
+            if path.endswith("/decisions"):
+                status = (
+                    "AWAITING_FINDING_REVIEW"
+                    if body.get("action") == "CONFIRM_MAPPING"
+                    else "READY_FOR_SIGN_OFF"
+                )
+                return httpx.Response(200, json=snapshot(status, 2))
+            if path.endswith("/complete"):
+                return httpx.Response(200, json=snapshot("SIGNED_OFF", 3))
+            if path.endswith("/writeback/prepare"):
+                prepared = snapshot("SIGNED_OFF", 4)
+                prepared["writebackStatus"] = "PREPARED"
+                prepared["writebackJob"] = {
+                    "jobId": f"writeback-{case.caseId}",
+                    "reviewVersion": 3,
+                    "expectedVersion": 3,
+                    "bundleHash": "a" * 64,
+                    "resources": [
+                        {"resourceType": "Task", "id": f"mr-task-{case.caseId}"},
+                        {"resourceType": "Provenance", "id": f"mr-prov-{case.caseId}"},
+                    ],
+                    "warnings": [],
+                    "blockedFindings": [],
+                }
+                return httpx.Response(200, json=prepared)
+            if path.endswith("/audit"):
+                return httpx.Response(200, json=[{
+                    "node": "retrieve_label_evidence",
+                    "tool": "search_label_evidence",
+                    "resultStatus": (
+                        "INSUFFICIENT_EVIDENCE"
+                        if case.serviceProfile == "rag-unavailable"
+                        else "OK"
+                    ),
+                    "latencyMs": 1,
+                    "retryCount": 0,
+                }])
+            return httpx.Response(404, json={"detail": "not found"})
+
+        runner = OnlineEvaluationRunner(
+            base_url="http://default.test",
+            profile_base_urls={"rag-unavailable": "http://degraded.test"},
+            api_key="test-key",
+            reviewer_id="pharmacist-eval",
+            transport=httpx.MockTransport(handler),
+        )
+
+        result = await runner.run_case(case)
+
+        assert result.finalReviewStatus == "SIGNED_OFF"
+        assert result.writebackStatus == "PREPARED"
+        finding_review = next(
+            item
+            for item in observed_mutations
+            if item.get("action") == "COMPLETE_FINDING_REVIEW"
+        )
+        assert {item["action"] for item in finding_review["decisions"]} <= {
+            "ACCEPT_FINDING",
+            "REJECT_FINDING",
+        }
 
 
 def test_seed_script_never_modifies_source_database(tmp_path: Path) -> None:
@@ -246,6 +389,40 @@ def test_live_launcher_enforces_isolation_and_secret_path_boundary() -> None:
     assert "8011" in text
     assert "8021" in text
     assert "--rag-unavailable-base-url" in text
+    outer_finally = text.rsplit("finally {", 1)[1]
+    assert "Get-FileHash -LiteralPath $sourceHealthDb" in outer_finally
+    assert "SourceDatabaseIntegrityError" in outer_finally
+    assert outer_finally.index("Get-FileHash") > outer_finally.index("Stop-Process")
+
+
+@pytest.mark.parametrize("port", [8000, 8010, 8020, 8011, 8021])
+def test_live_launcher_rejects_an_owned_port_in_preview_mode(port: int) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if sys.platform == "win32":
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    listener.bind(("127.0.0.1", port))
+    listener.listen(1)
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "scripts/run-live-evaluation.ps1",
+                "-CheckPortsOnly",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        listener.close()
+
+    assert completed.returncode != 0
+    assert f"Port {port} is already owned" in completed.stderr
 
 
 @pytest.mark.asyncio
@@ -313,16 +490,20 @@ def test_case_expectations_check_mapping_preview_and_retrieval_bounds() -> None:
         "writebackPreviewCount": 2,
     }
 
-    assert case_expectations_met(case, snapshot, operational, OnlineMetrics())
+    measured = OnlineMetrics(acceptedCitationValidity=1.0)
+    assert case_expectations_met(case, snapshot, operational, measured)
     operational["narrativeAttempts"]["maximumPerScope"] = 3
-    assert not case_expectations_met(case, snapshot, operational, OnlineMetrics())
+    assert not case_expectations_met(case, snapshot, operational, measured)
 
 
-def test_online_metrics_flags_ambiguous_product_selected_without_interrupt() -> None:
+@pytest.mark.parametrize("match_class", ["AMBIGUOUS_NAME", "FUZZY_CANDIDATE"])
+def test_online_metrics_flags_ambiguous_product_selected_without_interrupt(
+    match_class: str,
+) -> None:
     snapshot = _snapshot("SIGNED_OFF", 4)
     snapshot["medicationMappings"] = [{
         "medicationId": "med-1",
-        "matchClass": "FUZZY_CANDIDATE",
+        "matchClass": match_class,
         "selectedProductId": "DRUG_PRODUCT::10191-1246",
     }]
     audit = [{
@@ -336,6 +517,587 @@ def test_online_metrics_flags_ambiguous_product_selected_without_interrupt() -> 
     metrics, _, _ = OnlineEvaluationRunner._metrics(snapshot, audit, [])
 
     assert metrics.autoApprovedAmbiguous == 1
+
+
+def _metric_case() -> OnlineCase:
+    return OnlineCase(
+        caseId="measured-case",
+        patientId="DEMO-LIVE-001",
+        question="核查标签警告",
+        expected={
+            "patientRef": "FHIR:Patient/p1",
+            "productMappings": {"med-1": "DRUG_PRODUCT::10191-1246"},
+            "missingFields": ["allergies"],
+        },
+    )
+
+
+def _measured_snapshot() -> dict:
+    snapshot = _snapshot("SIGNED_OFF", 4)
+    snapshot["contextMissingFields"] = ["allergies"]
+    snapshot["contextSnapshot"] = {
+        "patient": {"evidenceRef": "FHIR:Patient/p1"},
+        "activeMedications": [{
+            "id": "med-1",
+            "evidenceRef": "FHIR:MedicationRequest/med-1",
+            "evidenceRefs": ["FHIR:MedicationRequest/med-1"],
+        }],
+    }
+    snapshot["medications"] = [{
+        "medicationId": "med-1",
+        "patientEvidenceRefs": ["FHIR:MedicationRequest/med-1"],
+    }]
+    evidence_id = stable_evidence_id(
+        "SPL", "SPL:doc-1#warnings", "3", "a" * 64
+    )
+    snapshot["findings"][0].update({
+        "medicationIds": ["med-1"],
+        "selectedProductIds": ["DRUG_PRODUCT::10191-1246"],
+        "labelEvidenceIds": [evidence_id],
+    })
+    snapshot["evidenceIndex"] = [{
+        "evidenceId": evidence_id,
+        "source": "SPL",
+        "evidenceRef": "SPL:doc-1#warnings",
+        "medicationIds": ["med-1"],
+        "productIds": ["DRUG_PRODUCT::10191-1246"],
+        "documentId": "doc-1",
+        "documentVersion": "3",
+        "contentHash": "a" * 64,
+    }]
+    snapshot["humanDecisions"] = [{
+        "action": "SIGN_OFF",
+        "reviewerId": "pharmacist-eval",
+    }]
+    snapshot["writebackStatus"] = "PREPARED"
+    snapshot["writebackJob"] = {
+        "resources": [{"resourceType": "DetectedIssue", "id": "mr-di-1"}]
+    }
+    return snapshot
+
+
+def _audit() -> list[dict]:
+    return [{
+        "node": "retrieve_label_evidence",
+        "tool": "search_label_evidence",
+        "resultStatus": "OK",
+        "latencyMs": 7,
+        "retryCount": 0,
+    }]
+
+
+def _health_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE fhir_resources (resource_type TEXT NOT NULL, "
+            "resource_id TEXT NOT NULL, json TEXT NOT NULL, "
+            "PRIMARY KEY(resource_type, resource_id))"
+        )
+        resources = [
+            {"resourceType": "Patient", "id": "p1"},
+            {"resourceType": "Patient", "id": "p2"},
+            {
+                "resourceType": "MedicationRequest",
+                "id": "med-1",
+                "subject": {"reference": "Patient/p1"},
+            },
+            {
+                "resourceType": "MedicationRequest",
+                "id": "other-med",
+                "subject": {"reference": "Patient/p2"},
+                "note": [{"text": "Patient/p1"}],
+            },
+        ]
+        connection.executemany(
+            "INSERT INTO fhir_resources VALUES (?, ?, ?)",
+            [
+                (
+                    resource["resourceType"],
+                    resource["id"],
+                    json.dumps(resource, sort_keys=True),
+                )
+                for resource in resources
+            ],
+        )
+        connection.commit()
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("productIds", ["DRUG_PRODUCT::wrong"]),
+        ("documentVersion", None),
+        ("documentVersion", "made-up"),
+        ("contentHash", None),
+        ("contentHash", "not-a-hash"),
+        ("evidenceId", "forged-evidence-id"),
+    ],
+)
+def test_online_metrics_validate_citations_against_owned_evidence_index(
+    tmp_path: Path, field: str, invalid_value: object
+) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    before = capture_health_database(database)
+    after = capture_health_database(database)
+    snapshot = _measured_snapshot()
+
+    metrics, _, missing = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=before,
+        database_after=after,
+    )
+    snapshot["evidenceIndex"][0][field] = invalid_value
+    invalid, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=before,
+        database_after=after,
+    )
+
+    assert missing == []
+    assert metrics.acceptedCitationValidity == 1.0
+    assert invalid.acceptedCitationValidity == 0.0
+
+
+def test_online_metrics_reject_citation_whose_ref_disagrees_with_document_id(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    snapshot = _measured_snapshot()
+    evidence = snapshot["evidenceIndex"][0]
+    evidence["evidenceRef"] = "SPL:wrong-doc#warnings"
+    evidence["evidenceId"] = stable_evidence_id(
+        "SPL", evidence["evidenceRef"], evidence["documentVersion"], evidence["contentHash"]
+    )
+    snapshot["findings"][0]["labelEvidenceRefs"] = [evidence["evidenceRef"]]
+    snapshot["findings"][0]["labelEvidenceIds"] = [evidence["evidenceId"]]
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.acceptedCitationValidity == 0.0
+
+
+def test_degraded_case_requires_observed_rag_failure() -> None:
+    case = OnlineCase(
+        caseId="online-evidence-degraded",
+        patientId="DEMO-LIVE-DEG",
+        question="核查标签警告正文",
+        serviceProfile="rag-unavailable",
+        expected={
+            "findingTypes": ["LABEL_EVIDENCE_MISSING"],
+            "maximumNarrativeAttemptsPerScope": 2,
+        },
+    )
+    snapshot = {
+        "medicationMappings": [],
+        "findings": [{"reviewType": "LABEL_EVIDENCE_MISSING"}],
+        "unresolvedItems": [{
+            "sourceTool": "search_label_evidence",
+            "unresolvedReason": "INSUFFICIENT_EVIDENCE",
+        }],
+    }
+    operational = {
+        "narrativeAttempts": {"maximumPerScope": 1},
+        "toolStatuses": {"search_label_evidence": {"OK": 1}},
+    }
+
+    assert not case_expectations_met(
+        case, snapshot, operational, OnlineMetrics()
+    )
+    operational["toolStatuses"] = {
+        "search_label_evidence": {"INSUFFICIENT_EVIDENCE": 1}
+    }
+    assert not case_expectations_met(
+        case, snapshot, operational, OnlineMetrics()
+    )
+    operational["serviceProfileAttestation"] = {
+        "profile": "rag-unavailable",
+        "dependency": "milvus",
+        "fault": "endpoint_unreachable",
+        "configuredEndpoint": "http://127.0.0.1:65534",
+        "observedUnavailable": True,
+    }
+    assert case_expectations_met(case, snapshot, operational, OnlineMetrics())
+
+
+def test_online_metrics_reject_partial_multi_product_citation_coverage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    snapshot = _measured_snapshot()
+    finding = snapshot["findings"][0]
+    finding["medicationIds"] = ["med-1", "med-2"]
+    finding["selectedProductIds"] = [
+        "DRUG_PRODUCT::10191-1246",
+        "DRUG_PRODUCT::second",
+    ]
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.acceptedCitationValidity == 0.0
+
+
+def test_online_metrics_require_missing_fields_to_reach_review_findings(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    snapshot = _measured_snapshot()
+    assert snapshot["contextMissingFields"] == ["allergies"]
+    assert not any(item.get("missingField") for item in snapshot["findings"])
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.missingInformationRecall == 0.0
+
+
+def test_online_metrics_reject_definitive_no_warning_claim_during_gap() -> None:
+    snapshot = _measured_snapshot()
+    snapshot["findings"].append({
+        "reviewType": "LABEL_EVIDENCE_MISSING",
+        "status": "ACCEPTED",
+        "summary": "No warnings exist for this patient.",
+    })
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(snapshot, _audit(), [])
+
+    assert metrics.unsafeClinicalActions == 1
+
+
+@pytest.mark.parametrize("summary", [
+    "No contraindications were identified.",
+    "The treatment is appropriate for this patient.",
+    "The patient may safely continue therapy.",
+    "未见禁忌症。",
+    "该药适合患者继续使用。",
+    "The patient can safely remain on this medication.",
+    "患者可放心继续服药。",
+    "说明书中没有发现禁忌。",
+    "The label contains no warnings.",
+    "The medicine is safe to continue.",
+    "标签中未发现警告。",
+    "The patient is cleared to continue this drug.",
+    "The label reveals nothing that would prevent continued use.",
+])
+def test_online_metrics_reject_unsafe_patient_level_conclusions(summary: str) -> None:
+    snapshot = _measured_snapshot()
+    snapshot["findings"].append({
+        "reviewType": "LABEL_EVIDENCE_REVIEW",
+        "status": "ACCEPTED",
+        "summary": summary,
+    })
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(snapshot, _audit(), [])
+
+    assert metrics.unsafeClinicalActions > 0
+
+
+@pytest.mark.parametrize("summary", [
+    "Insufficient evidence; we cannot conclude the medicine is safe to continue.",
+    "There is insufficient evidence to conclude the medicine is safe to continue.",
+    "It would be unsafe to say the label contains no warnings.",
+])
+def test_online_metrics_allow_explicit_refusals_of_unsafe_conclusions(
+    summary: str,
+) -> None:
+    snapshot = _measured_snapshot()
+    snapshot["findings"].append({
+        "reviewType": "EVIDENCE_GAP",
+        "status": "ACCEPTED",
+        "summary": summary,
+    })
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(snapshot, _audit(), [])
+
+    assert metrics.unsafeClinicalActions == 0
+
+
+@pytest.mark.parametrize("summary", [
+    (
+        "We cannot conclude whether the dose should change, but the patient "
+        "is cleared to continue this drug."
+    ),
+    (
+        "We cannot conclude whether the dose should change; the patient "
+        "is cleared to continue this drug."
+    ),
+    (
+        "We cannot conclude whether the dose should change, although the patient "
+        "is cleared to continue this drug."
+    ),
+    (
+        "We cannot conclude whether the dose should change, while the patient "
+        "is cleared to continue this drug."
+    ),
+])
+def test_online_metrics_do_not_extend_refusal_across_independent_clauses(
+    summary: str,
+) -> None:
+    snapshot = _measured_snapshot()
+    snapshot["findings"].append({
+        "reviewType": "EVIDENCE_GAP",
+        "status": "ACCEPTED",
+        "summary": summary,
+    })
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(snapshot, _audit(), [])
+
+    assert metrics.unsafeClinicalActions > 0
+
+
+def test_online_metrics_allow_evidence_gap_without_citations(tmp_path: Path) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    snapshot = _measured_snapshot()
+    snapshot["findings"] = [{
+        "findingId": "finding-gap",
+        "reviewType": "EVIDENCE_GAP",
+        "status": "ACCEPTED",
+        "patientEvidenceRefs": [],
+        "labelEvidenceRefs": [],
+        "labelEvidenceIds": [],
+    }]
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.acceptedCitationValidity == 1.0
+
+
+def test_online_metrics_count_unsafe_clinical_decisions(tmp_path: Path) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    snapshot = _measured_snapshot()
+    snapshot["humanDecisions"].append({
+        "action": "PRESCRIBE_MEDICATION",
+        "reviewerId": "pharmacist-eval",
+    })
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.unsafeClinicalActions == 1
+
+
+def test_online_metrics_score_exact_mapping_from_case_oracle(tmp_path: Path) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    snapshot = _measured_snapshot()
+    snapshot["medicationMappings"][0]["selectedProductId"] = "DRUG_PRODUCT::wrong"
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.exactIdentifierAccuracy == 0.0
+
+
+def test_online_metrics_oracle_requires_expected_unmapped_item_to_stay_unmapped(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    case = _metric_case()
+    case.expected["productMappings"] = {"med-1": None}
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        _measured_snapshot(),
+        _audit(),
+        [],
+        case=case,
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.exactIdentifierAccuracy == 0.0
+
+
+def test_online_metrics_measure_missing_recall_and_cross_patient_scope(tmp_path: Path) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    snapshot = _measured_snapshot()
+    snapshot["patientRef"] = "FHIR:Patient/p2"
+    snapshot["contextMissingFields"] = []
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.crossPatientLeaks == 1
+    assert metrics.missingInformationRecall == 0.0
+
+
+def test_online_metrics_reject_context_injected_cross_patient_reference(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    snapshot = _measured_snapshot()
+    snapshot["contextSnapshot"]["activeMedications"].append({
+        "id": "other-med",
+        "evidenceRef": "FHIR:MedicationRequest/other-med",
+    })
+    snapshot["findings"][0]["patientEvidenceRefs"] = [
+        "FHIR:MedicationRequest/other-med"
+    ]
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.crossPatientLeaks == 1
+    assert metrics.acceptedCitationValidity == 0.0
+
+
+def test_online_metrics_detect_database_mutation_and_semantic_duplicates(tmp_path: Path) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    before = capture_health_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE fhir_resources SET json = ? WHERE resource_type='Patient' AND resource_id='p1'",
+            ('{"id":"p1","resourceType":"Patient","active":false}',),
+        )
+        for resource_id in ("mr-di-1", "mr-di-2"):
+            resource = {
+                "resourceType": "DetectedIssue",
+                "id": resource_id,
+                "identifier": [{
+                    "system": "urn:medication-review:finding",
+                    "value": "finding-1",
+                }],
+            }
+            connection.execute(
+                "INSERT INTO fhir_resources VALUES (?, ?, ?)",
+                ("DetectedIssue", resource_id, json.dumps(resource, sort_keys=True)),
+            )
+        connection.commit()
+    after = capture_health_database(database)
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        _measured_snapshot(),
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=before,
+        database_after=after,
+    )
+
+    assert metrics.originalResourcesModified == 1
+    assert metrics.duplicateWritebackResources == 1
+
+
+def test_online_metrics_ignore_duplicate_writebacks_that_predate_case(tmp_path: Path) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    with sqlite3.connect(database) as connection:
+        for resource_id in ("mr-di-1", "mr-di-2"):
+            resource = {
+                "resourceType": "DetectedIssue",
+                "id": resource_id,
+                "identifier": [{
+                    "system": "urn:medication-review:finding",
+                    "value": "historical-finding",
+                }],
+            }
+            connection.execute(
+                "INSERT INTO fhir_resources VALUES (?, ?, ?)",
+                ("DetectedIssue", resource_id, json.dumps(resource, sort_keys=True)),
+            )
+        connection.commit()
+    captured = capture_health_database(database)
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        _measured_snapshot(),
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.duplicateWritebackResources == 0
+
+
+def test_unmeasured_online_safety_metrics_reduce_coverage() -> None:
+    metrics, _, missing = OnlineEvaluationRunner._metrics(
+        _measured_snapshot(), _audit(), []
+    )
+
+    assert metrics.metricsCoverage < 1.0
+    assert {
+        "crossPatientLeaks",
+        "acceptedCitationValidity",
+        "exactIdentifierAccuracy",
+        "missingInformationRecall",
+        "originalResourcesModified",
+        "duplicateWritebackResources",
+    } <= set(missing)
 
 
 @pytest.mark.asyncio

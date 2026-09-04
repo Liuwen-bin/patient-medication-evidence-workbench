@@ -166,7 +166,7 @@ Expected: 全部通过，并覆盖 prompt injection 不改变主题、productId�
 
 **Interfaces:**
 - Consumes: 已完成 review 的 accepted Findings、unresolved items、reviewer identity 和 review version。
-- Produces: `validate_medication_review_writeback(payload)` 与 `commit_medication_review_writeback(jobId, bundleHash, expectedVersion, confirmed)`。
+- Produces: `validate_medication_review_writeback(payload)` 与 `commit_medication_review_writeback(jobId, bundleHash, expectedVersion, confirmed, reviewerId)`。
 
 - [ ] **Step 1: 执行 Health MCP 的预览和事务提交任务**
 

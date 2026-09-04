@@ -17,7 +17,12 @@ Neo4j、Milvus 和模型配置。任一真实依赖缺失时 job 失败并上传
 `online-integration-report.json`，不会切换到 Fixture。
 
 `commit_synthetic=true` 只允许写入本次运行目录中的 Health SQLite 副本。launcher 会在
-运行前后校验源数据库 SHA-256 与修改时间，并且只终止自己启动的进程。
+运行前后校验源数据库 SHA-256 与修改时间，并且只终止自己启动的进程。无论 preview 还是
+commit 模式，五个服务端口只要有一个已占用就拒绝启动，避免把外部进程误记为本次运行。
+
+在线安全指标不使用成功默认值：case 文件提供患者、产品映射和缺失字段 oracle，FHIR 引用
+归属从隔离 Health 数据库校验，SPL 引用绑定从 `evidenceIndex` 校验，源资源变化和语义重复
+写回从数据库前后快照计算；缺少任何观测都会降低 `metricsCoverage`。
 
 公开摘要只保留 case ID、聚合指标、执行模式和机器可读失败码，不包含患者姓名、完整
 Patient ID、原始证据、服务端点、prompt、隐藏推理或凭据。

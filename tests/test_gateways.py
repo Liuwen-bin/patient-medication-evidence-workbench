@@ -61,13 +61,16 @@ async def test_health_gateway_commit_preserves_confirmation_fields() -> None:
     caller = FakeCaller({"commit_medication_review_writeback": envelope()})
     gateway = HealthRecordGateway(caller)
 
-    await gateway.commit_writeback("job-1", "a" * 64, 7, True)
+    await gateway.commit_writeback(
+        "job-1", "a" * 64, 7, True, "pharmacist-001"
+    )
 
     assert caller.calls == [("commit_medication_review_writeback", {
         "jobId": "job-1",
         "bundleHash": "a" * 64,
         "expectedVersion": 7,
         "confirmed": True,
+        "reviewerId": "pharmacist-001",
     })]
 
 

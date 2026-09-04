@@ -53,6 +53,7 @@ Preview request:
   "reviewVersion": 7,
   "patientRef": "Patient/demo-001",
   "reviewerId": "pharmacist-001",
+  "signedAt": "2026-09-04T10:11:12+08:00",
   "findings": [],
   "unresolvedItems": [],
   "agent": {
@@ -63,6 +64,9 @@ Preview request:
   "syntheticData": true
 }
 ```
+
+`signedAt` 必须来自持久化的最终 `SIGN_OFF.occurredAt` 且带时区；Health MCP 将它规范化为
+UTC 后写入 `Provenance.recorded`，因此重复 preview 得到同一个不可变 Bundle/hash。
 
 Preview success `ToolEnvelope.data`:
 
@@ -559,8 +563,8 @@ Expected: tests PASS; preview creates only a job row and leaves every `fhir_reso
 - Modify in Health MCP: `tests/test_writeback_service.py`
 
 **Interfaces:**
-- Consumes: `jobId: str`, `bundleHash: str`, `expectedVersion: int`, `confirmed: bool`.
-- Produces: `ReviewWritebackService.commit_medication_review_writeback(job_id: str, bundle_hash: str, expected_version: int, confirmed: bool) -> dict[str, Any]`.
+- Consumes: `jobId: str`, `bundleHash: str`, `expectedVersion: int`, `confirmed: bool`, `reviewerId: str`.
+- Produces: `ReviewWritebackService.commit_medication_review_writeback(job_id: str, bundle_hash: str, expected_version: int, confirmed: bool, reviewer_id: str) -> dict[str, Any]`.
 
 - [ ] **Step 1: Write failing confirmation and hash tests**
 
@@ -569,7 +573,8 @@ Expected: tests PASS; preview creates only a job row and leaves every `fhir_reso
 def test_commit_requires_literal_true(db_path: Path, confirmed: bool | None) -> None:
     service, preview = prepared_service(db_path)
     result = service.commit_medication_review_writeback(
-        preview["jobId"], preview["bundleHash"], preview["expectedVersion"], confirmed
+        preview["jobId"], preview["bundleHash"], preview["expectedVersion"], confirmed,
+        "pharmacist-001",
     )
     assert result["status"] == "ERROR"
     assert count_writeback_resources(db_path) == 0
@@ -577,7 +582,9 @@ def test_commit_requires_literal_true(db_path: Path, confirmed: bool | None) -> 
 
 def test_commit_rejects_hash_or_version_mismatch(db_path: Path) -> None:
     service, preview = prepared_service(db_path)
-    wrong = service.commit_medication_review_writeback(preview["jobId"], "0" * 64, 999, True)
+    wrong = service.commit_medication_review_writeback(
+        preview["jobId"], "0" * 64, 999, True, "pharmacist-001"
+    )
     assert wrong["data"]["error"]["code"] == "WRITEBACK_CONFIRMATION_MISMATCH"
     assert count_writeback_resources(db_path) == 0
 ```
@@ -615,7 +622,9 @@ On any exception, call `connection.rollback()`, keep the job retryable as `prepa
 def test_failed_transaction_rolls_back_all_new_resources(db_path: Path, monkeypatch) -> None:
     service, preview = prepared_service(db_path, findings=[accepted_route_mismatch()], unresolved=[missing_patient_field()])
     monkeypatch.setattr(service, "_insert_resource", fail_on_second_insert())
-    result = service.commit_medication_review_writeback(preview["jobId"], preview["bundleHash"], 7, True)
+    result = service.commit_medication_review_writeback(
+        preview["jobId"], preview["bundleHash"], 7, True, "pharmacist-001"
+    )
     assert result["status"] == "ERROR"
     assert count_writeback_resources(db_path) == 0
     assert fetch_job(db_path, "review-001", 7)["status"] == "prepared"
@@ -624,7 +633,9 @@ def test_failed_transaction_rolls_back_all_new_resources(db_path: Path, monkeypa
 def test_commit_never_changes_original_clinical_resources(db_path: Path) -> None:
     before = fetch_original_resource_bytes(db_path)
     service, preview = prepared_service(db_path)
-    result = service.commit_medication_review_writeback(preview["jobId"], preview["bundleHash"], 7, True)
+    result = service.commit_medication_review_writeback(
+        preview["jobId"], preview["bundleHash"], 7, True, "pharmacist-001"
+    )
     assert result["status"] == "OK"
     assert fetch_original_resource_bytes(db_path) == before
 ```
@@ -634,9 +645,13 @@ def test_commit_never_changes_original_clinical_resources(db_path: Path) -> None
 ```python
 def test_same_commit_is_idempotent(db_path: Path) -> None:
     service, preview = prepared_service(db_path)
-    first = service.commit_medication_review_writeback(preview["jobId"], preview["bundleHash"], 7, True)
+    first = service.commit_medication_review_writeback(
+        preview["jobId"], preview["bundleHash"], 7, True, "pharmacist-001"
+    )
     count = count_writeback_resources(db_path)
-    second = service.commit_medication_review_writeback(preview["jobId"], preview["bundleHash"], 7, True)
+    second = service.commit_medication_review_writeback(
+        preview["jobId"], preview["bundleHash"], 7, True, "pharmacist-001"
+    )
     assert second["status"] == "OK"
     assert second["data"]["created"] == first["data"]["created"]
     assert second["data"]["idempotentReplay"] is True
@@ -665,7 +680,7 @@ Expected: PASS; rollback leaves zero new resources; repeated commit leaves count
 
 **Interfaces:**
 - Consumes: `ReviewWritebackService` from Tasks 1-3.
-- Produces: MCP tools `validate_medication_review_writeback(payload)` and `commit_medication_review_writeback(jobId, bundleHash, expectedVersion, confirmed)`.
+- Produces: MCP tools `validate_medication_review_writeback(payload)` and `commit_medication_review_writeback(jobId, bundleHash, expectedVersion, confirmed, reviewerId)`.
 
 - [ ] **Step 1: Write failing MCP registration tests**
 
@@ -703,9 +718,11 @@ def create_mcp_server(
 
 ```python
 @mcp.tool()
-def validate_medication_review_writeback(payload: dict[str, Any]) -> dict[str, Any]:
+def validate_medication_review_writeback(payload: ReviewWritebackPayload) -> dict[str, Any]:
     """Validate and preview an already pharmacist-reviewed writeback; does not modify FHIR resources."""
-    return writeback_service.validate_medication_review_writeback(payload)
+    return writeback_service.validate_medication_review_writeback(
+        payload.model_dump(mode="json")
+    )
 
 
 @mcp.tool()
@@ -714,10 +731,11 @@ def commit_medication_review_writeback(
     bundleHash: str,
     expectedVersion: int,
     confirmed: bool,
+    reviewerId: str,
 ) -> dict[str, Any]:
     """Commit one previously previewed bundle when every confirmation field matches."""
     return writeback_service.commit_medication_review_writeback(
-        jobId, bundleHash, expectedVersion, confirmed
+        jobId, bundleHash, expectedVersion, confirmed, reviewerId
     )
 ```
 
@@ -747,7 +765,7 @@ git commit -m "feat: expose guarded medication review writeback tools"
 
 **Interfaces:**
 - Consumes: the frozen MCP request/response contract above.
-- Produces: `HealthRecordGateway.validate_writeback(payload: dict[str, Any]) -> TimedToolResult` and `HealthRecordGateway.commit_writeback(job_id: str, bundle_hash: str, expected_version: int, confirmed: bool) -> TimedToolResult`.
+- Produces: `HealthRecordGateway.validate_writeback(payload: dict[str, Any]) -> TimedToolResult` and `HealthRecordGateway.commit_writeback(job_id: str, bundle_hash: str, expected_version: int, confirmed: bool, reviewer_id: str) -> TimedToolResult`.
 
 - [ ] **Step 1: Write failing exact-argument tests**
 
@@ -766,9 +784,10 @@ async def test_health_gateway_calls_preview_with_payload() -> None:
 async def test_health_gateway_commit_preserves_confirmation_fields() -> None:
     caller = FakeCaller({"commit_medication_review_writeback": envelope()})
     gateway = HealthRecordGateway(caller)
-    await gateway.commit_writeback("job-1", "a" * 64, 7, True)
+    await gateway.commit_writeback("job-1", "a" * 64, 7, True, "pharmacist-001")
     assert caller.calls[-1] == ("commit_medication_review_writeback", {
-        "jobId": "job-1", "bundleHash": "a" * 64, "expectedVersion": 7, "confirmed": True,
+        "jobId": "job-1", "bundleHash": "a" * 64, "expectedVersion": 7,
+        "confirmed": True, "reviewerId": "pharmacist-001",
     })
 ```
 
@@ -781,12 +800,14 @@ async def validate_writeback(self, payload: dict[str, Any]) -> TimedToolResult:
 
 async def commit_writeback(
     self, job_id: str, bundle_hash: str, expected_version: int, confirmed: bool,
+    reviewer_id: str,
 ) -> TimedToolResult:
     return await self._call("commit_medication_review_writeback", {
         "jobId": job_id,
         "bundleHash": bundle_hash,
         "expectedVersion": expected_version,
         "confirmed": confirmed,
+        "reviewerId": reviewer_id,
     })
 ```
 

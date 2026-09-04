@@ -1,5 +1,16 @@
 from playwright.sync_api import Page, expect
 
+from tests import conftest as test_config
+
+
+def test_live_server_port_selection_skips_chromium_blocked_port() -> None:
+    candidates = iter((6697, 8020))
+    select_browser_safe_port = getattr(
+        test_config, "_select_browser_safe_port", lambda allocate: allocate()
+    )
+
+    assert select_browser_safe_port(lambda: next(candidates)) == 8020
+
 
 def test_empty_workbench_is_actionable(page: Page, live_server_url: str) -> None:
     page.goto(live_server_url)

@@ -108,6 +108,7 @@ class HealthRecordGateway(_Gateway):
         bundle_hash: str,
         expected_version: int,
         confirmed: bool,
+        reviewer_id: str,
     ) -> TimedToolResult:
         return await self._call(
             "commit_medication_review_writeback",
@@ -116,6 +117,7 @@ class HealthRecordGateway(_Gateway):
                 "bundleHash": bundle_hash,
                 "expectedVersion": expected_version,
                 "confirmed": confirmed,
+                "reviewerId": reviewer_id,
             },
         )
 

@@ -733,7 +733,10 @@ def test_run_recovers_owned_journal_before_orphan_checkpoint_rejection(tmp_path:
         "action": "RUN", "patientRef": "P001", "asOf": None,
         "question": DEFAULT_QUESTION,
     }
-    import hashlib, json, base64, pickle
+    import base64
+    import hashlib
+    import json
+    import pickle
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     fingerprint = hashlib.sha256(canonical.encode()).hexdigest()
     mutation_id = hashlib.sha256(f"{review.reviewId}:0:{fingerprint}".encode()).hexdigest()

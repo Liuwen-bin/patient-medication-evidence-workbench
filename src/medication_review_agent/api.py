@@ -533,8 +533,13 @@ def create_app(
             coordinator = WritebackCoordinator(dependencies.health)
             try:
                 result = await coordinator.commit(
-                    snapshot.writebackJob, confirmed=body.confirmed
+                    snapshot,
+                    snapshot.writebackJob,
+                    body.reviewerId,
+                    confirmed=body.confirmed,
                 )
+            except WritebackStateError as exc:
+                raise HTTPException(403, str(exc)) from exc
             except (WritebackError, ToolContractError) as exc:
                 failure = (
                     WritebackFailure(
