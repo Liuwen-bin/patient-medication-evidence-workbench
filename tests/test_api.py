@@ -465,7 +465,10 @@ def test_run_recovers_owned_journal_before_orphan_checkpoint_rejection(tmp_path:
         review_id=f"owned-{journal_state.lower()}",
     )
     checkpoint_path = tmp_path / "checkpoints.sqlite"
-    payload = {"action": "RUN", "patientRef": "P001", "asOf": None}
+    payload = {
+        "action": "RUN", "patientRef": "P001", "asOf": None,
+        "question": DEFAULT_QUESTION,
+    }
     import hashlib, json, base64, pickle
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     fingerprint = hashlib.sha256(canonical.encode()).hexdigest()

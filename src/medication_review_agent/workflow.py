@@ -29,6 +29,7 @@ class ReviewState(TypedDict, total=False):
     reviewId: str
     schemaVersion: str
     status: str
+    question: str
     patientRef: str | None
     asOf: str | None
     contextSnapshot: dict[str, Any]
@@ -360,8 +361,13 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
     async def plan_review(state: ReviewState) -> dict[str, Any]:
         context = state.get("contextSnapshot") or {}
         features = {"age": (context.get("patient") or {}).get("age"), "allergies": context.get("allergies") or [], "specialPopulations": context.get("specialPopulations") or []}
-        plan = await dependencies.planner.plan(features, [MedicationMapping.model_validate(item) for item in state.get("medicationMappings", [])], state.get("contextMissingFields", []))
-        return {"reviewPlan": [item.model_dump(mode="json") for item in plan]}
+        planning = await dependencies.planner.plan(
+            state.get("question") or "默认用药证据核查",
+            features,
+            [MedicationMapping.model_validate(item) for item in state.get("medicationMappings", [])],
+            state.get("contextMissingFields", []),
+        )
+        return {"reviewPlan": [item.model_dump(mode="json") for item in planning.items]}
 
     async def retrieve_evidence(state: ReviewState) -> dict[str, Any]:
         selected = [item["selectedProductId"] for item in state.get("medicationMappings", []) if item.get("selectedProductId")]
@@ -604,7 +610,8 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             "allergies": context.get("allergies") or [],
             "specialPopulations": context.get("specialPopulations") or [],
         }
-        plan = await dependencies.planner.plan(
+        planning = await dependencies.planner.plan(
+            state.get("question") or "默认用药证据核查",
             features,
             [MedicationMapping.model_validate(item) for item in state.get("medicationMappings", [])],
             list(missing),
@@ -613,7 +620,7 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             "contextSnapshot": context,
             "contextMissingFields": list(missing),
             "medications": medications,
-            "reviewPlan": [item.model_dump(mode="json") for item in plan],
+            "reviewPlan": [item.model_dump(mode="json") for item in planning.items],
             "findings": findings, "reinvestigateFindingIds": [], "metrics": metrics,
             "contextMedicationsChanged": medications_changed,
             "contextChangedMedicationIds": changed_ids,

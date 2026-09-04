@@ -72,6 +72,8 @@ class ModelCallRecord(ContractModel):
     outputTokens: int = Field(ge=0)
     estimatedCost: float = Field(ge=0.0)
     latencyMs: int = Field(ge=0)
+    usageAvailable: bool = False
+    costAvailable: bool = False
     fallback: bool = False
     failureCode: str | None = None
 

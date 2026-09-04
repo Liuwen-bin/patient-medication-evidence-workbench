@@ -19,7 +19,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
 from .gateways import DrugEvidenceGateway, HealthRecordGateway
-from .planner import DeterministicPlanner
+from .planner import build_planner_from_env
 from .models import AuditEvent, ReviewStatus
 from .report import ReportNotSigned, build_signed_report, render_report_html, render_report_json
 from .repository import ReviewNotFound, ReviewRepository, ReviewVersionConflict
@@ -296,7 +296,7 @@ def create_app(
             payload_snapshot = get_review(review_id)
             payload = {
                 "action": "RUN", "patientRef": payload_snapshot.patientRef,
-                "asOf": payload_snapshot.asOf,
+                "asOf": payload_snapshot.asOf, "question": payload_snapshot.question,
             }
             mutation_id, _ = mutation_identity(review_id, payload_snapshot.version, payload)
             owned_before_recovery = dependencies.repository.get_mutation(mutation_id)
@@ -308,11 +308,15 @@ def create_app(
                 raise HTTPException(409, "Review has already started")
             if await checkpoint_exists(review_id):
                 raise HTTPException(409, "Created review has an unowned checkpoint")
-            payload = {"action": "RUN", "patientRef": snapshot.patientRef, "asOf": snapshot.asOf}
+            payload = {
+                "action": "RUN", "patientRef": snapshot.patientRef,
+                "asOf": snapshot.asOf, "question": snapshot.question,
+            }
             return await mutate(
                 review_id, expected_version=snapshot.version, payload=payload,
                 command={"reviewId": review_id, "patientRef": snapshot.patientRef,
-                         "asOf": snapshot.asOf, "mutationId": mutation_identity(review_id, snapshot.version, payload)[0]},
+                         "asOf": snapshot.asOf, "question": snapshot.question,
+                         "mutationId": mutation_identity(review_id, snapshot.version, payload)[0]},
             )
 
     @app.get("/api/reviews/{review_id}")
@@ -406,7 +410,7 @@ def build_app_from_env() -> FastAPI:
     repository = ReviewRepository(os.getenv("REVIEW_DB_PATH", "data/reviews.sqlite"))
     dependencies = ReviewDependencies(
         health=HealthRecordGateway.from_env(), drug=DrugEvidenceGateway.from_env(),
-        repository=repository, planner=DeterministicPlanner(),
+        repository=repository, planner=build_planner_from_env(),
     )
     return create_app(dependencies, checkpoint_path=os.getenv("REVIEW_CHECKPOINT_DB", "data/review-checkpoints.sqlite"))
 
