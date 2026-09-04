@@ -14,7 +14,7 @@ $timestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $runDirectory = Join-Path $reviewRoot "artifacts/live-runs/$timestamp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 $canonicalReport = Join-Path $reviewRoot "artifacts/evaluation/online-integration-report.json"
 $runReport = Join-Path $runDirectory "online-integration-report.json"
-$sourceHealthDb = Join-Path $HealthRoot "data/chinese-demo-record.sqlite"
+$sourceHealthDb = $null
 $evaluationHealthDb = Join-Path $runDirectory "health-eval.sqlite"
 $ragFaultAttestation = Join-Path $runDirectory "rag-fault-attestation.json"
 $startedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
@@ -146,6 +146,7 @@ if ($CheckPortsOnly) {
     }
 }
 
+$sourceHealthDb = Join-Path $HealthRoot "data/chinese-demo-record.sqlite"
 New-Item -ItemType Directory -Force $runDirectory | Out-Null
 $stage = "validate_inputs"
 try {
