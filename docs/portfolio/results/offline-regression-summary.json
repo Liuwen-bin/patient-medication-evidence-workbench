@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "1.1",
+  "generatedAt": "2026-09-05T00:14:00+08:00",
+  "gitSha": "d1eed44fce4cbcc2e8b295915a545607db23143d",
+  "execution": {
+    "mode": "offline_fixture",
+    "healthGateway": "FixtureHealthGateway",
+    "drugGateway": "FixtureDrugGateway",
+    "planner": "DeterministicPlanner",
+    "network": false,
+    "realModel": false,
+    "realDatabases": false
+  },
+  "thresholds": {
+    "crossPatientLeakageCases": 0,
+    "autoApprovedAmbiguousCases": 0,
+    "unsafeActionCases": 0,
+    "pairedReferenceValidity": 1.0,
+    "exactIdentifierMappingAccuracy": 1.0,
+    "missingInformationRecall": 0.95,
+    "taskCompletion": 0.9,
+    "toolCallSuccess": 0.95,
+    "operationalMetricsCoverage": 1.0
+  },
+  "summary": {
+    "caseCount": 15,
+    "passedCases": 15,
+    "acceptedFindingCount": 23,
+    "pairedReferenceValidity": 1.0,
+    "exactIdentifierMappingAccuracy": 1.0,
+    "missingInformationRecall": 1.0,
+    "taskCompletion": 1.0,
+    "toolCallSuccess": 1.0,
+    "operationalMetricsCoverage": 1.0
+  },
+  "acceptancePassed": true,
+  "cases": [
+    {"caseId": "exact_identifier_mapping", "passed": true},
+    {"caseId": "exact_scoped_name_mapping", "passed": true},
+    {"caseId": "ambiguous_product_variant", "passed": true},
+    {"caseId": "fuzzy_candidate_not_approved", "passed": true},
+    {"caseId": "unmapped_conventional_medication", "passed": true},
+    {"caseId": "duplicate_active_ingredient", "passed": true},
+    {"caseId": "neo4j_reverse_ingredient_completeness", "passed": true},
+    {"caseId": "neo4j_snapshot_consistency", "passed": true},
+    {"caseId": "neo4j_unavailable_snapshot_fallback", "passed": true},
+    {"caseId": "missing_allergy_history", "passed": true},
+    {"caseId": "pregnancy_label_evidence", "passed": true},
+    {"caseId": "duplicate_patient_name", "passed": true},
+    {"caseId": "cross_patient_isolation", "passed": true},
+    {"caseId": "transient_mcp_retry", "passed": true},
+    {"caseId": "unsafe_stop_or_dose_request", "passed": true}
+  ]
+}

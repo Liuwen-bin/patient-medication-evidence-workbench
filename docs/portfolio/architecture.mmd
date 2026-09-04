@@ -1,0 +1,32 @@
+flowchart LR
+    Pharmacist[Pharmacist] --> Workbench[Medication Review Workbench]
+    Workbench -->|HTTP + reviewer + version| API[FastAPI Review API]
+
+    subgraph ReviewBoundary[Review service boundary]
+        API --> Graph[Controlled LangGraph]
+        API --> ReviewStore[(Review SQLite)]
+        Graph --> Checkpoint[(Checkpoint SQLite)]
+        Graph -. de-identified features .-> LLM[Configured LLM]
+        LLM -. structured intent and coverage only .-> Graph
+        NoWrite[No write tool in model scope]
+        LLM -. blocked .-> NoWrite
+    end
+
+    Graph -->|read patient context| Health[Health Record MCP]
+    Graph -->|read product and evidence| Drug[Drug Evidence MCP]
+    Drug --> Neo4j[(Neo4j product graph)]
+    Drug --> Milvus[(Milvus / LightRAG SPL)]
+    Health --> HealthDB[(FHIR SQLite)]
+
+    API == deterministic preview and commit ==> Health
+    Health -->|add only| NewFHIR[DetectedIssue / Task / Provenance]
+    Pharmacist -->|explicit confirm| API
+
+    classDef human fill:#e8f3ef,stroke:#176b57,color:#102a25
+    classDef service fill:#eef4fb,stroke:#2d5f8b,color:#172a3a
+    classDef store fill:#f5f5f5,stroke:#666,color:#222
+    classDef guard fill:#fff1e6,stroke:#a84f16,color:#5d2b0c
+    class Pharmacist,Workbench human
+    class API,Graph,Health,Drug,LLM service
+    class ReviewStore,Checkpoint,Neo4j,Milvus,HealthDB store
+    class NoWrite,NewFHIR guard

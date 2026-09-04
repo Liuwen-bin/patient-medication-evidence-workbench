@@ -1,0 +1,31 @@
+stateDiagram-v2
+    [*] --> CREATED
+    CREATED --> COLLECTING_CONTEXT: run
+    COLLECTING_CONTEXT --> AWAITING_PATIENT_CONFIRMATION: patient ambiguous
+    AWAITING_PATIENT_CONFIRMATION --> COLLECTING_CONTEXT: confirm current candidate
+    COLLECTING_CONTEXT --> MAPPING_MEDICATIONS: patient fixed
+    MAPPING_MEDICATIONS --> AWAITING_MAPPING_CONFIRMATION: ambiguous or fuzzy product
+    AWAITING_MAPPING_CONFIRMATION --> RETRIEVING_EVIDENCE: confirm current product
+    MAPPING_MEDICATIONS --> RETRIEVING_EVIDENCE: exact or unmapped
+    RETRIEVING_EVIDENCE --> AWAITING_FINDING_REVIEW: verified findings
+    AWAITING_FINDING_REVIEW --> NEEDS_MORE_EVIDENCE: request once
+    NEEDS_MORE_EVIDENCE --> RETRIEVING_EVIDENCE: bounded reinvestigation
+    AWAITING_FINDING_REVIEW --> READY_FOR_SIGN_OFF: all decisions complete
+    READY_FOR_SIGN_OFF --> SIGNED_OFF: pharmacist completes review
+
+    state "Writeback side effect" as Writeback {
+        [*] --> NOT_REQUESTED
+        NOT_REQUESTED --> PREPARED: immutable preview
+        PREPARED --> COMMITTED: confirmed + hash + version
+        PREPARED --> FAILED: transaction or dependency failure
+        FAILED --> PREPARED: retry preview
+        COMMITTED --> COMMITTED: idempotent replay
+    }
+
+    SIGNED_OFF --> Writeback
+    CREATED --> CANCELLED: cancel
+    AWAITING_PATIENT_CONFIRMATION --> CANCELLED: cancel
+    AWAITING_MAPPING_CONFIRMATION --> CANCELLED: cancel
+    AWAITING_FINDING_REVIEW --> CANCELLED: cancel
+    SIGNED_OFF --> [*]
+    CANCELLED --> [*]
