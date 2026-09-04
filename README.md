@@ -95,7 +95,7 @@ python mcp/mcp_server.py --transport http --host 127.0.0.1 --port 8000
 
 ```powershell
 Set-Location C:\Users\Administrator\Downloads\dm_spl_release_homeopathic\homeopathic\dailymed_lightrag
-python -m dailymed_lightrag.drug_mcp_server --transport http --host 127.0.0.1 --port 8010
+python -m medication_review_agent.dailymed_compat --transport http --host 127.0.0.1 --port 8010
 ```
 
 终端 3，Review API：
@@ -143,12 +143,11 @@ powershell -ExecutionPolicy Bypass -File scripts/run-live-evaluation.ps1
 information recall 和 task completion 均为 1.0。它使用 `FixtureHealthGateway`、
 `FixtureDrugGateway` 与 `DeterministicPlanner`，不能代表线上质量或延迟。
 
-真实在线运行：5 个 case 全部发起。第一次运行暴露 Milvus `19530` 未启动；启动 Docker
-中的 Milvus、Neo4j、etcd 和 MinIO 后再次运行，Drug MCP 已连接两个数据库，但
-首个 MCP session 关闭时会 finalize 共享 LightRAG；后续 session 复用该对象时 `_driver`
-已经为空，5/5 最终以 `DEPENDENCY_TIMEOUT` 失败。完成率和指标覆盖率均为 0；第一例记录了
-一次模型上游失败并回退，最小直连探针同样返回 `APIConnectionError`，因此没有成功模型调用，
-也没有发生写回。真实失败始终保留，没有用 Fixture 结果替代。
+最新真实在线运行（`f358ee1`）：Health/Drug MCP 与真实数据库链路完成 5/5 个 case，全部到达
+`SIGNED_OFF` 并生成写回预览；引用有效率、精确标识准确率、缺失信息召回率、任务完成率和
+指标覆盖率均为 1.0，五项零容忍安全计数均为 0。模型端点在五次规划中都发生
+`MODEL_UPSTREAM_ERROR` 并显式回退，因此 `realModel=false`、整体 `acceptancePassed=false`。
+这个结果证明业务闭环和降级路径可用，但不代表真实模型质量已经验收。
 
 可公开结果：[离线摘要](docs/portfolio/results/offline-regression-summary.json) ·
 [在线摘要](docs/portfolio/results/online-integration-summary.json) ·
@@ -163,8 +162,7 @@ information recall 和 task completion 均为 1.0。它使用 `FixtureHealthGate
 ## 关键取舍与失败案例
 
 核心取舍是“规则控制安全和写回，模型只处理适合语义判断的部分”；报告只是 ReviewState
-投影，不是主业务。已观察并记录模型 schema/上游降级、Milvus 启动失败和 MCP/LightRAG
-生命周期不匹配，
+投影，不是主业务。已观察并记录模型上游降级、Milvus 故障与 MCP/LightRAG 生命周期修复，
 以及 stale version/写回冲突；每个案例都包含失败码、安全行为和回归测试，见
 [取舍与失败复盘](docs/portfolio/tradeoffs-and-failures.md)。
 
@@ -179,7 +177,7 @@ MedicationRequest 始终称为“活动用药医嘱”，不声称患者实际�
 
 ## 后续演进条件
 
-- 统一 Drug MCP session 与 LightRAG storage 生命周期、恢复模型端点后重跑五例在线评测；目标完成率至少 80%、安全零容忍指标全部为 0、指标覆盖率 100%。
+- 恢复模型端点后重跑五例在线评测，要求 `realModel=true` 后才能把当前 5/5 业务完成升级为完整在线验收。
 - 用独立临床标注集验证缺失信息 recall，再讨论生产阈值和告警。
 - 多 worker 前把 mutation lock、checkpoint lease 和幂等协调迁移到共享基础设施。
 - 只有新增相互作用库/指南等独立知识域，或单患者十种以上用药造成可测延迟瓶颈时，才拆分多 Agent。

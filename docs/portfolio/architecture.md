@@ -33,8 +33,10 @@ FHIR:MedicationRequest/med-1
   -> DetectedIssue/Task + Provenance preview
 ```
 
-非 `EVIDENCE_GAP` Finding 缺少任何一侧引用都不能接受。SPL 引用还要绑定已确认产品、文档
-版本、section 和 content hash，避免跨产品或索引漂移造成的“看似相关”。
+非缺口类 Finding 缺少任何一侧引用都不能接受。`EVIDENCE_GAP`、`LABEL_EVIDENCE_MISSING` 和
+`PRODUCT_UNMAPPED` 只能表达尚未解决的信息，不要求伪造完整标签绑定，但已有患者引用仍必须
+属于当前患者。SPL 引用还要绑定已确认产品、文档版本、section 和 content hash，避免跨产品
+或索引漂移造成的“看似相关”。
 
 ## 状态与并发
 
@@ -81,6 +83,10 @@ commit 校验相同 job/hash/version/confirmed/reviewer，在单个 SQLite 事�
 `Task`、`Provenance`。`Provenance.recorded` 取自持久化的 `SIGN_OFF.occurredAt`，而不是构建
 Bundle 时临时生成；时间和 Bundle 一起参与不可变预览。重复相同请求返回原资源 ID，不重复
 插入；同版本不同 hash 返回冲突。
+
+Drug MCP 由本项目兼容入口维护持久 Streamable HTTP session，避免请求结束时提前销毁共享
+LightRAG/Neo4j storage；连接失败后会丢弃旧 session 并重建。Milvus 不可用时只能使用带故障
+证明和原始 provenance 的确定性图谱回退，不能把缺失正文包装成已验证证据。
 
 ## 预算与故障语义
 

@@ -11,23 +11,23 @@
 | 写回 | preview/commit 两阶段、只新增 | 操作多一步，换来明确确认、事务和幂等 |
 | 评测 | Fixture CI 与真实在线报告分离 | 在线依赖较重，但不会把模拟性能当真实能力 |
 
-## 失败 1：模型 schema 不合格
+## 失败 1：模型上游连接被重置
 
-- 输入条件：模型返回超出主题白名单、缺字段或无法通过 `ReviewIntent` schema 的结构化输出。
-- 可见症状：primary planner 结果被拒绝，audit/modelCalls 记录失败而不是使用半合法字段。
-- 机器码：`MODEL_SCHEMA_INVALID` 或对应 planner failure code。
-- 安全行为：切换 `DeterministicPlanner`；不扩大主题、不改变 patient/product scope，也不增加工具权限。
-- 回归测试：`tests/test_planner.py` 的结构化输出、白名单和 fallback 用例；`tests/test_workflow.py` 的 prompt injection 用例。
-- 状态：已修复为显式降级机制。限制是降级计划更保守，不代表模型语义质量达标。
+- 输入条件：2026-09-05、提交 `f358ee1` 的真实五例运行使用外部模型配置；独立最小调用和五次规划都在读取响应时被上游重置连接。
+- 可见症状：每例都到达 `SIGNED_OFF` 和写回预览，但 `modelCalls` 的 token/usage 不可用且 `modelFallback=true`。
+- 机器码：`MODEL_UPSTREAM_ERROR`。
+- 安全行为：切换 `DeterministicPlanner`，不扩大 patient/product scope、主题、工具权限或循环预算；业务链路完成 5/5，但报告强制 `realModel=false`、`acceptancePassed=false`。
+- 回归测试：`tests/test_planner.py` 的 schema、上游异常与 fallback 用例；`tests/test_online_evaluation.py` 的真实组件和接受条件用例。
+- 状态：显式降级和真实性标记已实现；上游端点仍是外部限制，恢复后必须重跑，不能用这次 5/5 证明模型质量。
 
 ## 失败 2：MCP session 与检索存储生命周期不匹配
 
-- 输入条件：2026-09-05 第一次本机在线五例中 Milvus `19530` 未监听；启动 Docker 中的 Milvus、Neo4j、etcd 和 MinIO 后原样重跑。
-- 可见症状：第一次在 Milvus collection 初始化失败；第二次已连接 Milvus/Neo4j，首个 MCP session 能正常完成初始化和工具调用，但 session 关闭时执行 `finalize_storages()`。后续 session 复用同一个 `rag` 对象时 `_driver` 已为空，5 个 case 仍各在约 120 秒超时。第一例记录了一次 `MODEL_UPSTREAM_ERROR` fallback；独立最小探针也返回 `APIConnectionError/httpx.ReadError`，没有成功模型调用。
-- 机器码：runner 记录 `DEPENDENCY_TIMEOUT`；公开摘要中的依赖原因为 `MCP_SESSION_STORAGE_LIFECYCLE_MISMATCH`。
-- 安全行为：在线验收 `false`、task completion/metrics coverage 为 0；没有生成 Finding 结论，没有写回，也没有用 Fixture 替换结果。
-- 回归测试：`tests/test_online_evaluation.py::test_online_runner_labels_dependency_timeouts` 和 launcher 失败报告/进程清理契约。
-- 状态：Drug MCP 的 session/storage 生命周期限制仍存在，本项目按约束不修改 Drug MCP；生命周期统一且模型端点恢复后必须重跑五例，不能把当前报告改写为成功。
+- 输入条件：早期本机运行中 Milvus `19530` 未监听；依赖启动后，首个 MCP session 关闭又提前执行共享 LightRAG 的 `finalize_storages()`。
+- 可见症状：后续 session 复用已终止对象，Neo4j driver 为空，五例在依赖边界超时。
+- 机器码：历史运行记录 `DEPENDENCY_TIMEOUT` 与 `MCP_SESSION_STORAGE_LIFECYCLE_MISMATCH`。
+- 安全行为：该次验收失败且没有写回；没有用 Fixture 替换。降级用例还要求可审计的 Milvus 故障证明，不能把服务异常解释成“没有证据”。
+- 回归测试：`tests/test_gateways.py` 的持久 session/失败重连用例、`tests/test_dailymed_compat.py` 的兼容与 provenance 用例，以及 launcher 的隔离/清理契约。
+- 状态：已在本项目兼容层修复，未修改 `dailymed_lightrag`。最新真实运行 `realDatabases=true`，五例均完成；故障注入例也通过。
 
 ## 失败 3：陈旧版本和写回冲突
 
@@ -40,7 +40,7 @@
 
 ## 没有被美化的结果
 
-离线 15/15 只能说明确定性规则与 Fixture 合同回归通过。真实在线 0/5 表明当前 Drug MCP
-的 MCP/LightRAG 生命周期未闭合且模型端点不可用，因此无法声称真实模型、完整数据库链路、在线延迟或
-在线写回达到阈值。公开摘要保留两者，面试演示可以用 Fixture 展示交互，但必须同步说明在线
-失败证据。
+离线 15/15 只能说明确定性规则与 Fixture 合同回归通过。最新真实在线运行在真实 MCP/数据库
+链路上业务完成 5/5，聚合安全和质量指标达标，说明生命周期修复与降级路径有效；但五次模型
+规划全部回退，`realModel=false`，因此完整在线验收仍为 false。面试时必须同时讲清“业务闭环
+通过”和“模型质量未验收”，不能把二者合并成一个成功结论。

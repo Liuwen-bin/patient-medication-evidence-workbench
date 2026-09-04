@@ -40,10 +40,10 @@
 
 ### 2:40-3:00 审计与结果
 
-展示审计时间线和评测摘要。说明：离线 15/15 是 Fixture 回归；真实在线五例已发起，但当前
-Drug MCP 的 MCP session 与 LightRAG storage 生命周期不匹配，导致 5/5 超时；模型调用也只
-记录到上游失败与 fallback，没有成功观测，结果明确不通过。这证明失败路径也可观测，且没有
-用离线结果冒充在线质量。
+展示审计时间线和评测摘要。说明：离线 15/15 是 Fixture 回归；最新真实在线运行在 Health/Drug
+MCP 和真实数据库上完成 5/5，所有安全与质量指标达标。五次模型规划均因
+`MODEL_UPSTREAM_ERROR` 显式回退，所以 `realModel=false`、完整在线验收仍不通过。这同时证明
+业务闭环能安全降级，也没有把确定性回退冒充真实模型质量。
 
 ## 十分钟技术叙事
 
@@ -96,17 +96,16 @@ Health MCP 保持患者范围和 FHIR 语义；Drug MCP 保持产品、SPL、Neo
 
 ### 8:00-9:00 真实失败
 
-第一次真实运行暴露 Milvus 未启动；启动 Docker 中的 Milvus、Neo4j、etcd 和 MinIO 后重跑，
-首个 MCP session 已成功连接数据库并调用工具，但关闭时 finalize 共享 LightRAG；后续 session
-复用已终止对象，`Neo4jDrugGraphRepository` 因 `_driver` 为空失败。模型端点同时出现
-`APIConnectionError/httpx.ReadError`。五例仍在 120 秒边界失败并归入 `DEPENDENCY_TIMEOUT`；
-公开结果保持不通过。详见 `tradeoffs-and-failures.md`。
+第一次真实运行暴露 Milvus 未启动，第二次暴露 MCP session 关闭时提前 finalize 共享 LightRAG。
+兼容层改为持久 Streamable HTTP session，并在失败后重连；最新运行已在真实 Neo4j/Milvus 和
+两个 MCP 上完成 5/5，引用、映射、缺失信息、完成率与覆盖率均为 1.0。模型端点仍出现
+`APIConnectionError/httpx.ReadError`，五次规划都记录 `MODEL_UPSTREAM_ERROR` 并回退，因此
+公开报告仍明确 `acceptancePassed=false`。详见 `tradeoffs-and-failures.md`。
 
 ### 9:00-10:00 演进条件
 
-先统一 Drug MCP session 与 LightRAG storage 生命周期、恢复模型端点并达到在线完成率、覆盖率
-和安全阈值，再谈部署。多 worker 需要共享锁与幂等协调；多 Agent 只有在新增至少两个独立知识域或十种以上
-用药导致可测上下文/延迟瓶颈时成立。
+当前先恢复模型端点并取得 `realModel=true` 的五例证据，再谈部署。多 worker 需要共享锁与幂等
+协调；多 Agent 只有在新增至少两个独立知识域，或十种以上用药造成可测上下文/延迟瓶颈时成立。
 
 ## 八个常见追问
 
