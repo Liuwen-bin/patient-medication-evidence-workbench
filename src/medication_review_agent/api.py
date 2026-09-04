@@ -23,6 +23,7 @@ from .planner import build_planner_from_env
 from .models import AuditEvent, ReviewStatus
 from .report import ReportNotSigned, build_signed_report, render_report_html, render_report_json
 from .repository import ReviewNotFound, ReviewRepository, ReviewVersionConflict
+from .retrieval import build_grader_from_env
 from .safety import QuestionSafetyDecision, evaluate_review_question
 from .workflow import ReviewDependencies, build_review_graph, open_sqlite_checkpointer, state_to_snapshot
 
@@ -446,6 +447,7 @@ def build_app_from_env() -> FastAPI:
     dependencies = ReviewDependencies(
         health=HealthRecordGateway.from_env(), drug=DrugEvidenceGateway.from_env(),
         repository=repository, planner=build_planner_from_env(),
+        grader=build_grader_from_env(),
     )
     return create_app(dependencies, checkpoint_path=os.getenv("REVIEW_CHECKPOINT_DB", "data/review-checkpoints.sqlite"))
 

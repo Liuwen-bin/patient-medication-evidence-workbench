@@ -174,6 +174,13 @@ class EvidenceItem(ContractModel):
     productIds: list[str] = Field(default_factory=list)
     topic: str | None = None
     summary: str | None = None
+    documentId: str | None = None
+    documentVersion: str | None = None
+    effectiveTime: str | None = None
+    sectionId: str | None = None
+    sectionCode: str | None = None
+    sourcePath: str | None = None
+    contentHash: str | None = None
     graphProvenance: GraphEvidenceProvenance | None = None
 
 
@@ -190,6 +197,7 @@ class Finding(ContractModel):
     selectedProductIds: list[str] = Field(default_factory=list)
     patientEvidenceRefs: list[str] = Field(default_factory=list)
     labelEvidenceRefs: list[str] = Field(default_factory=list)
+    labelEvidenceIds: list[str] = Field(default_factory=list)
     status: FindingStatus = FindingStatus.PENDING
     requiresHumanReview: bool = False
     verificationErrors: list[str] = Field(default_factory=list)
@@ -213,6 +221,7 @@ def migrate_finding_payload(payload: dict[str, Any]) -> dict[str, Any]:
         migrated["ruleId"] = f"legacy-{slug or 'finding'}-v1"
     migrated.setdefault("normalizationVersion", None)
     migrated.setdefault("comparisonInputs", {})
+    migrated.setdefault("labelEvidenceIds", [])
     return migrated
 
 

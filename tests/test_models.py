@@ -12,6 +12,7 @@ from medication_review_agent.models import (
     ReviewStatus,
     ToolEnvelope,
     WritebackStatus,
+    migrate_finding_payload,
 )
 
 
@@ -55,6 +56,25 @@ def test_evidence_gap_can_be_accepted_without_paired_evidence() -> None:
         status=FindingStatus.ACCEPTED,
     )
     assert finding.status == FindingStatus.ACCEPTED
+
+
+def test_finding_label_evidence_ids_default_migrate_and_round_trip() -> None:
+    payload = {
+        "findingId": "f1",
+        "reviewType": "LABEL_WARNING",
+        "ruleId": "label-warning-v1",
+        "summary": "Candidate warning",
+        "attentionLevel": "HIGH",
+        "confidence": 0.9,
+        "labelEvidenceRefs": ["SPL:doc-1#warnings"],
+    }
+
+    legacy = Finding.model_validate(migrate_finding_payload(payload))
+    assert legacy.labelEvidenceIds == []
+
+    bound = Finding.model_validate({**payload, "labelEvidenceIds": ["evidence-v4"]})
+    restored = Finding.model_validate_json(bound.model_dump_json())
+    assert restored.labelEvidenceIds == ["evidence-v4"]
 
 
 def test_graph_provenance_survives_mapping_evidence_and_snapshot() -> None:

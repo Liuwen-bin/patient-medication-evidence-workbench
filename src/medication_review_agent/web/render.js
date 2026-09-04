@@ -387,10 +387,20 @@ export function renderEvidence(review, target, selectedFindingId) {
   if (!(finding.patientEvidenceRefs || []).length) patientSection.append(element("p", { text: "未记录患者证据" }));
   const labelSection = element("section", { className: "evidence-section" });
   labelSection.append(heading("标签原文（SPL / RAG）", 3));
-  const evidenceItems = (review.evidenceIndex || []).filter((item) =>
-    (finding.labelEvidenceRefs || []).includes(item.evidenceRef));
-  (finding.labelEvidenceRefs || []).forEach((ref) => {
-    const item = evidenceItems.find((candidate) => candidate.evidenceRef === ref);
+  const evidenceIds = finding.labelEvidenceIds || [];
+  const evidenceItems = evidenceIds.length
+    ? evidenceIds.map((id) => (review.evidenceIndex || []).find((item) => item.evidenceId === id)).filter(Boolean)
+    : (review.evidenceIndex || []).filter((item) =>
+      (finding.labelEvidenceRefs || []).includes(item.evidenceRef));
+  const evidenceBindings = evidenceIds.length
+    ? evidenceIds.map((id, index) => {
+      const item = (review.evidenceIndex || []).find((candidate) => candidate.evidenceId === id);
+      return { item, ref: item?.evidenceRef || (finding.labelEvidenceRefs || [])[index] || id };
+    })
+    : (finding.labelEvidenceRefs || []).map((ref) => ({
+      item: evidenceItems.find((candidate) => candidate.evidenceRef === ref), ref,
+    }));
+  evidenceBindings.forEach(({ item, ref }) => {
     labelSection.append(
       element("p", { className: "evidence-ref", text: ref }),
       element("blockquote", { text: item?.summary || "标签原文摘要未记录" }),
@@ -403,7 +413,7 @@ export function renderEvidence(review, target, selectedFindingId) {
       }));
     }
   });
-  if (!(finding.labelEvidenceRefs || []).length) labelSection.append(element("p", { text: "未记录标签证据" }));
+  if (!evidenceBindings.length) labelSection.append(element("p", { text: "未记录标签证据" }));
   const graph = graphProvenanceBlock(finding.graphProvenance || evidenceItems[0]?.graphProvenance);
   if (graph) labelSection.prepend(graph);
   target.append(patientSection, labelSection);

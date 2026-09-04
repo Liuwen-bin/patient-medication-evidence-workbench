@@ -171,6 +171,36 @@ def test_selecting_finding_shows_fhir_spl_rag_and_graph_evidence(
     expect(panel).to_contain_text("Neo4j 在线图谱")
 
 
+def test_finding_uses_evidence_id_when_versions_reuse_the_same_reference(
+    page: Page, live_server_url: str
+) -> None:
+    snapshot = _review(status="AWAITING_FINDING_REVIEW")
+    old_evidence = {
+        **snapshot["evidenceIndex"][0],
+        "evidenceId": "evidence-v3",
+        "documentVersion": "3",
+        "contentHash": "a" * 64,
+        "summary": "Version three warning text.",
+    }
+    new_evidence = {
+        **old_evidence,
+        "evidenceId": "evidence-v4",
+        "documentVersion": "4",
+        "contentHash": "b" * 64,
+        "summary": "Version four warning text.",
+    }
+    snapshot["evidenceIndex"] = [old_evidence, new_evidence]
+    snapshot["findings"][0]["labelEvidenceIds"] = ["evidence-v4"]
+    _mock_review(page, snapshot)
+
+    page.goto(f"{live_server_url}/?review=review-ui")
+    page.get_by_role("button", name="重复活性成分", exact=True).click()
+
+    panel = page.locator("#evidence-panel")
+    expect(panel).to_contain_text("Version four warning text.")
+    expect(panel).not_to_contain_text("Version three warning text.")
+
+
 def test_label_images_allow_same_origin_and_api_urls_only(
     page: Page, live_server_url: str
 ) -> None:

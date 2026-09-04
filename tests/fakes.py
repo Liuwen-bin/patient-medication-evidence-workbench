@@ -75,7 +75,19 @@ class FakeDrugGateway:
 
     async def search_label_evidence(self, product_ids: list[str], topics: list[str], question: str | None) -> TimedToolResult:
         self.calls.append(("search_label_evidence", product_ids))
-        return self._take("search")
+        result = self._take("search")
+        if result.envelope.status.value != "OK":
+            return result
+        data = dict(result.envelope.data)
+        data["evidence"] = [
+            item
+            for item in data.get("evidence", [])
+            if not item.get("topic") or item.get("topic") in topics
+        ]
+        return TimedToolResult(
+            envelope=result.envelope.model_copy(update={"data": data}),
+            latency_ms=result.latency_ms,
+        )
 
     async def compare_product_ingredients(self, product_ids: list[str]) -> TimedToolResult:
         self.calls.append(("compare_product_ingredients", product_ids))
@@ -99,20 +111,66 @@ def mapped_response(*, backend: str = "neo4j", fallback: bool = False, consisten
     })
 
 
-def standard_drug_responses(resolve: dict[str, TimedToolResult]) -> dict[str, TimedToolResult]:
+def standard_drug_responses(
+    resolve: dict[str, TimedToolResult | list[TimedToolResult]],
+) -> dict[str, TimedToolResult | list[TimedToolResult]]:
+    document = {
+        "documentId": "doc-1",
+        "documentVersion": "3",
+        "effectiveTime": "20260831",
+        "sourcePath": "labels/doc-1.xml",
+        "contentHash": "a" * 64,
+    }
+    topics = ["identity", "ingredients", "route", "dosage_form", "warnings"]
+    product_ids: set[str] = set()
+    for configured in resolve.values():
+        for response in configured if isinstance(configured, list) else [configured]:
+            data = response.envelope.data
+            selected = data.get("selectedProductId")
+            if isinstance(selected, str) and selected:
+                product_ids.add(selected)
+            product_ids.update(
+                candidate["productId"]
+                for candidate in data.get("candidates", [])
+                if isinstance(candidate, dict)
+                and isinstance(candidate.get("productId"), str)
+                and candidate["productId"]
+            )
+    product_ids = product_ids or {"DRUG_PRODUCT::1"}
+    fact_responses = [
+        envelope("OK", {"product": {
+            "productId": product_id,
+            **document,
+        }}, provenance={
+            "graphBackend": "neo4j", "graphWorkspace": "dailymed",
+            "graphDatabase": "neo4j", "fallbackUsed": False,
+            "consistency": {"status": "CONSISTENT"},
+        })
+        for product_id in sorted(product_ids)
+    ]
+    search_responses = [
+        envelope("OK", {"evidence": [{
+            "referenceId": f"S-{topic}",
+            "productId": product_id,
+            **document,
+            "sectionId": topic,
+            "sectionCode": "34071-1",
+            "topic": topic,
+            "content": f"Label evidence for {topic}.",
+            "evidenceRef": f"SPL:doc-1#{topic}",
+        } for topic in topics]}, refs=[
+            f"SPL:doc-1#{topic}" for topic in topics
+        ], provenance={
+            "graphBackend": "neo4j", "graphWorkspace": "dailymed",
+            "graphDatabase": "neo4j", "fallbackUsed": False,
+            "consistency": {"status": "CONSISTENT"},
+        })
+        for product_id in sorted(product_ids)
+    ]
     return {
         **{f"resolve:{name}": value for name, value in resolve.items()},
-        "facts": envelope("OK", {"product": {"productId": "DRUG_PRODUCT::1"}}, provenance={
-            "graphBackend": "neo4j", "graphWorkspace": "dailymed", "graphDatabase": "neo4j",
-            "fallbackUsed": False, "consistency": {"status": "CONSISTENT"},
-        }),
-        "search": envelope("OK", {"evidence": [{
-            "referenceId": "S1", "documentId": "doc-1", "sectionId": "warnings",
-            "content": "Label warning", "evidenceRef": "SPL:doc-1#warnings",
-        }]}, refs=["SPL:doc-1#warnings"], provenance={
-            "graphBackend": "neo4j", "graphWorkspace": "dailymed", "graphDatabase": "neo4j",
-            "fallbackUsed": False, "consistency": {"status": "CONSISTENT"},
-        }),
+        "facts": fact_responses[0] if len(fact_responses) == 1 else fact_responses,
+        "search": search_responses[0] if len(search_responses) == 1 else search_responses,
         "compare": envelope("OK", {"sharedActiveIngredients": []}),
         "validate": envelope("OK", {"claims": []}),
     }
@@ -126,6 +184,7 @@ def build_test_graph(
     review_id: str = "review-1",
     question: str = "默认用药证据核查",
     planner=None,
+    grader=None,
 ):
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
     try:
@@ -142,6 +201,7 @@ def build_test_graph(
         drug=drug,
         repository=repository,
         planner=planner if planner is not None else DeterministicPlanner(),
+        grader=grader,
     )
     checkpointer = open_sqlite_checkpointer(tmp_path / "checkpoints.sqlite")
     return build_review_graph(dependencies, checkpointer)

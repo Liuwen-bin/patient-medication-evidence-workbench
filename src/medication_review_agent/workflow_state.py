@@ -33,6 +33,7 @@ class ReviewState(TypedDict, total=False):
     reinvestigateFindingIds: list[str]
     contextMedicationsChanged: bool
     contextChangedMedicationIds: list[str]
+    contextRebuildPending: bool
 
 
 class PatientConfirmation(BaseModel):

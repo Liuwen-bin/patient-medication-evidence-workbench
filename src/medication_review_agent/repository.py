@@ -54,7 +54,13 @@ def migrate_review_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 _HASH_SUMMARY_KEYS = {"patientIdHash", "medicationIdHash", "productIdHash"}
-_COUNT_SUMMARY_KEYS = {"productCount", "topicCount", "claimCount", "medicationCount"}
+_COUNT_SUMMARY_KEYS = {
+    "productCount",
+    "topicCount",
+    "claimCount",
+    "medicationCount",
+    "evidenceCount",
+}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 

@@ -158,17 +158,40 @@ class FixtureDrugGateway:
 
     async def get_product_facts(self, product_id: str) -> TimedToolResult:
         self.calls.append("get_product_facts")
-        return _timed("OK", {"product": {"productId": product_id}}, provenance=self._graph_for_products([product_id]))
+        document = product_id.replace("DRUG_PRODUCT::", "doc-").lower()
+        return _timed("OK", {"product": {
+            "productId": product_id,
+            "documentId": document,
+            "documentVersion": "1",
+            "effectiveTime": "20260831",
+            "sourcePath": f"labels/{document}.xml",
+            "contentHash": "a" * 64,
+        }}, provenance=self._graph_for_products([product_id]))
 
     async def search_label_evidence(self, product_ids: list[str], topics: list[str], question: str | None) -> TimedToolResult:
         self.calls.append("search_label_evidence")
         document = product_ids[0].replace("DRUG_PRODUCT::", "doc-").lower()
-        evidence_ref = f"SPL:{document}#warnings"
-        return _timed("OK", {"evidence": [{
-            "referenceId": "S1", "documentId": document, "sectionId": "warnings",
-            "sectionTitle": "Warnings", "content": "Synthetic label evidence.",
-            "evidenceRef": evidence_ref,
-        }]}, refs=[evidence_ref], provenance=self._graph_for_products(product_ids))
+        evidence = [{
+            "referenceId": f"S-{topic}",
+            "productId": product_ids[0],
+            "documentId": document,
+            "documentVersion": "1",
+            "effectiveTime": "20260831",
+            "sectionId": topic,
+            "sectionCode": "34071-1",
+            "sectionTitle": topic.replace("_", " ").title(),
+            "sourcePath": f"labels/{document}.xml",
+            "contentHash": "a" * 64,
+            "topic": topic,
+            "content": f"Synthetic label evidence for {topic}.",
+            "evidenceRef": f"SPL:{document}#{topic}",
+        } for topic in topics]
+        return _timed(
+            "OK",
+            {"evidence": evidence},
+            refs=[item["evidenceRef"] for item in evidence],
+            provenance=self._graph_for_products(product_ids),
+        )
 
     async def compare_product_ingredients(self, product_ids: list[str]) -> TimedToolResult:
         self.calls.append("compare_product_ingredients")
