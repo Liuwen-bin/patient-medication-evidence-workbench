@@ -46,11 +46,33 @@ API 默认监听 `http://127.0.0.1:8020`。所有 mutation 默认要求非空 `R
 ## 测试和评估
 
 ```powershell
-python -m pytest tests -q
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = '1'
+python -m pytest tests `
+  --ignore=tests/test_web_render.py `
+  --ignore=tests/test_web_decisions.py `
+  --ignore=tests/test_web_visual.py `
+  -q -p pytest_asyncio.plugin
+```
+
+浏览器与视觉测试需要在一个新的 PowerShell 进程中运行：
+
+```powershell
+Remove-Item Env:PYTEST_DISABLE_PLUGIN_AUTOLOAD -ErrorAction SilentlyContinue
+python -m pytest `
+  tests/test_web_render.py `
+  tests/test_web_decisions.py `
+  tests/test_web_visual.py -q
+```
+
+离线评估：
+
+```powershell
 medication-review-evaluate --cases evaluation/cases.jsonl --output artifacts/evaluation/report.json
 ```
 
 评估包含 15 个稳定合成案例，覆盖精确/歧义/模糊/未映射、Neo4j 反向成分遍历与集合比较、snapshot 一致性和 fallback、患者隔离、缺失病史、人工恢复、瞬时重试以及禁止的停药/剂量请求。输出记录安全阈值、映射与缺失信息指标、工具成功率、延迟、重试、token 和估算成本。
+
+上述测试和评估均使用合成数据与 Fixture gateway，只用于确定性回归，不代表真实 LLM、MCP、Neo4j、Milvus 或 DailyMed 在线链路的质量和性能。基线详情见 `docs/baseline/2026-09-04-baseline.md`。
 
 ## 关键约束
 
