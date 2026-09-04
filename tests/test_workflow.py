@@ -91,6 +91,43 @@ def test_workflow_reexports_all_interrupt_contracts() -> None:
     assert compatibility_type is extracted_type
 
 
+@pytest.mark.asyncio
+async def test_normalized_medication_preserves_referenced_resource_evidence(
+    tmp_path: Path,
+) -> None:
+    medication = {
+        **MED1,
+        "strengthSource": "Medication.code.text",
+        "routeCodings": [{"system": "urn:route", "code": "PO"}],
+        "dosageForm": "Tablet",
+        "dosageFormCodings": [{"system": "urn:form", "code": "TAB"}],
+        "medicationReference": "Medication/medication-1",
+        "evidenceRefs": [
+            "FHIR:Medication/medication-1",
+            "FHIR:MedicationRequest/med-1",
+        ],
+        "effectivePeriod": {"start": "2026-08-01", "end": "2026-09-01"},
+    }
+    graph = build_test_graph(
+        tmp_path,
+        FakeHealthGateway(health_context(medication)),
+        FakeDrugGateway(standard_drug_responses({"ARNICA": mapped_response()})),
+    )
+
+    result = await graph.ainvoke(
+        {"reviewId": "review-1", "patientRef": "P001", "asOf": "2026-08-31"},
+        config={"configurable": {"thread_id": "review-1"}},
+    )
+    normalized = result["medications"][0]
+
+    assert normalized["medicationReference"] == "Medication/medication-1"
+    assert normalized["strengthSource"] == "Medication.code.text"
+    assert normalized["routeCodings"][0]["code"] == "PO"
+    assert normalized["dosageFormCodings"][0]["code"] == "TAB"
+    assert normalized["patientEvidenceRefs"] == medication["evidenceRefs"]
+    await graph.checkpointer.conn.close()
+
+
 def test_deidentified_features_drop_nested_identity_values() -> None:
     features = deidentified_patient_features({
         "patient": {"id": "patient-secret", "name": "person-secret", "age": 42},

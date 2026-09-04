@@ -551,8 +551,19 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             records.append(MedicationRecord(
                 medicationId=str(item.get("id")), name=str(item.get("medication") or "Unknown"),
                 identifiers=item.get("identifiers") or [], strength=item.get("strength"),
-                dosageForm=item.get("dosageForm"), route=item.get("route"), dosage=item.get("dosage"),
-                patientEvidenceRefs=[item["evidenceRef"]] if item.get("evidenceRef") else [],
+                strengthSource=item.get("strengthSource"),
+                dosageForm=item.get("dosageForm"),
+                dosageFormCodings=item.get("dosageFormCodings") or [],
+                route=item.get("route"), routeCodings=item.get("routeCodings") or [],
+                dosage=item.get("dosage"),
+                medicationReference=item.get("medicationReference"),
+                medicationEvidenceRefs=item.get("evidenceRefs") or [],
+                authoredOn=item.get("authoredOn"),
+                effectivePeriod=item.get("effectivePeriod"),
+                patientEvidenceRefs=(
+                    item.get("evidenceRefs")
+                    or ([item["evidenceRef"]] if item.get("evidenceRef") else [])
+                ),
             ).model_dump(mode="json"))
         return records
 

@@ -140,9 +140,16 @@ class MedicationRecord(ContractModel):
     name: str
     identifiers: list[dict[str, str]] = Field(default_factory=list)
     strength: str | None = None
+    strengthSource: str | None = None
     dosageForm: str | None = None
+    dosageFormCodings: list[dict[str, str]] = Field(default_factory=list)
     route: str | None = None
+    routeCodings: list[dict[str, str]] = Field(default_factory=list)
     dosage: str | None = None
+    medicationReference: str | None = None
+    medicationEvidenceRefs: list[str] = Field(default_factory=list)
+    authoredOn: str | None = None
+    effectivePeriod: dict[str, str] | None = None
     patientEvidenceRefs: list[str] = Field(default_factory=list)
 
 
