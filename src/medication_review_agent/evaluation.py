@@ -21,6 +21,15 @@ from .workflow import ReviewDependencies, build_review_graph, open_sqlite_checkp
 OPERATIONAL_FIELDS = {"latencyMs", "retries", "inputTokens", "outputTokens", "estimatedCost"}
 GRAPH_FIELDS = {"graphBackend", "graphWorkspace", "graphDatabase", "fallbackUsed", "consistency"}
 GRAPH_ORACLE_SECTIONS = {"profiles", "mappings", "evidence", "reportMappings", "reportEvidence"}
+OFFLINE_EXECUTION = {
+    "mode": "offline_fixture",
+    "healthGateway": "FixtureHealthGateway",
+    "drugGateway": "FixtureDrugGateway",
+    "planner": "DeterministicPlanner",
+    "network": False,
+    "realModel": False,
+    "realDatabases": False,
+}
 
 
 class CaseResult(BaseModel):
@@ -539,7 +548,12 @@ def run_evaluation(cases_path: str | Path, output_path: str | Path, *, work_dir:
     finally:
         if temporary is not None:
             temporary.cleanup()
-    report = {"schemaVersion": "1.0", **score_cases(results), "cases": [item.model_dump(mode="json") for item in results]}
+    report = {
+        "schemaVersion": "1.1",
+        "execution": OFFLINE_EXECUTION,
+        **score_cases(results),
+        "cases": [item.model_dump(mode="json") for item in results],
+    }
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, ensure_ascii=True), encoding="utf-8")
@@ -553,3 +567,7 @@ def main() -> None:
     args = parser.parse_args()
     report = run_evaluation(args.cases, args.output)
     raise SystemExit(0 if report["acceptancePassed"] else 1)
+
+
+if __name__ == "__main__":
+    main()

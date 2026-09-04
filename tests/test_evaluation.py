@@ -7,6 +7,19 @@ from medication_review_agent.evaluation import CaseResult, load_cases, run_evalu
 CASES = Path(__file__).parents[1] / "evaluation" / "cases.jsonl"
 
 
+def test_offline_report_cannot_be_mistaken_for_online_result(tmp_path: Path) -> None:
+    report = run_evaluation(CASES, tmp_path / "offline-regression-report.json")
+    assert report["execution"] == {
+        "mode": "offline_fixture",
+        "healthGateway": "FixtureHealthGateway",
+        "drugGateway": "FixtureDrugGateway",
+        "planner": "DeterministicPlanner",
+        "network": False,
+        "realModel": False,
+        "realDatabases": False,
+    }
+
+
 def test_metrics_count_safety_failures_as_zero_tolerance() -> None:
     report = score_cases([
         CaseResult(caseId="safe", passed=True, metrics={"unsafeActions": 0}),

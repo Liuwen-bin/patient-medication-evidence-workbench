@@ -24,6 +24,8 @@ data/*.db
 # Generated temporary output
 tmp/
 artifacts/tmp/
+artifacts/evaluation/
+artifacts/live-runs/
 playwright-report/
 test-results/
 
