@@ -213,6 +213,10 @@ def test_online_case_manifest_has_five_stable_cases() -> None:
     assert "PRODUCT_UNMAPPED" in cases[3].findingDecisions
     assert "LABEL_EVIDENCE_REVIEW" in cases[4].findingDecisions
     assert all(
+        case.findingDecisions.get("LABEL_EVIDENCE_MISSING") == "ACCEPT_FINDING"
+        for case in cases
+    )
+    assert all(
         set(case.expected.get("findingTypes") or []) <= set(case.findingDecisions)
         for case in cases
     )
