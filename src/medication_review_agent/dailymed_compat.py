@@ -19,9 +19,10 @@ _EFFECTIVE_TIME = re.compile(
 _SECTION_TITLE = re.compile(r"^Section title:\s*(.+?)\s*$", re.MULTILINE)
 _TOPIC_MARKERS = {
     "identity": ("drugproduct", "drug product", "product code", "document id"),
-    "ingredients": ("ingredient", "active substance", "成分"),
+    "ingredients": ("ingredient", "active substance", "whole plant", "成分"),
     "route": (
-        "administration route", "administered_via", "sublingual", "oral",
+        "administration route", "administered_via", "sublingual", "under tongue",
+        "in mouth", "oral",
         "topical", "intramuscular", "intravenous",
     ),
     "dosage_form": (

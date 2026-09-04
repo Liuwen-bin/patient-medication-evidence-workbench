@@ -403,3 +403,26 @@ async def test_confirmed_local_narrative_fills_a_vector_search_gap() -> None:
         "topic": "warnings",
     }]
     assert "Vector retrieval unavailable." in result["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_homeopathic_label_terms_cover_ingredient_and_route_topics() -> None:
+    narrative = SOURCE_CONTENT.replace(
+        "Section: WARNINGS SECTION",
+        "Section: INDICATIONS & USAGE SECTION",
+    ).replace(
+        "Warnings: Stop use and ask a doctor if symptoms persist.",
+        "ARNICA MONTANA 30X (Whole Plant). Dissolve pellets under tongue.",
+    )
+    rag_service = FakeRagService(narrative)
+    service_class = build_compatible_evidence_service(FakeBaseEvidenceService)
+    service = service_class(FakeGraph(), rag_service)
+
+    result = await service.search_label_evidence(
+        [PRODUCT_ID], ["ingredients", "route"]
+    )
+
+    assert {item["topic"] for item in result["data"]["evidence"]} == {
+        "ingredients",
+        "route",
+    }

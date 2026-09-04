@@ -234,6 +234,8 @@ def _accepted_citations_are_valid(
     is_gap = finding.get("reviewType") in gap_types
     if patient_refs and not patient_refs <= allowed_patient_refs:
         return False
+    if is_gap:
+        return True
     if not is_gap and (not patient_refs or not label_refs or not label_ids):
         return False
     if not label_refs and not label_ids:

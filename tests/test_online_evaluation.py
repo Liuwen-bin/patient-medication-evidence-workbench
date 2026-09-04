@@ -976,6 +976,33 @@ def test_online_metrics_allow_evidence_gap_without_citations(tmp_path: Path) -> 
     assert metrics.acceptedCitationValidity == 1.0
 
 
+def test_online_metrics_allow_label_gap_with_partial_unbound_references(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "health.sqlite"
+    _health_database(database)
+    captured = capture_health_database(database)
+    snapshot = _measured_snapshot()
+    snapshot["findings"] = [{
+        "reviewType": "LABEL_EVIDENCE_MISSING",
+        "status": "ACCEPTED",
+        "patientEvidenceRefs": [],
+        "labelEvidenceRefs": ["SPL:partially-retrieved#warning"],
+        "labelEvidenceIds": [],
+    }]
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+        database_before=captured,
+        database_after=captured,
+    )
+
+    assert metrics.acceptedCitationValidity == 1.0
+
+
 def test_online_metrics_count_unsafe_clinical_decisions(tmp_path: Path) -> None:
     database = tmp_path / "health.sqlite"
     _health_database(database)
