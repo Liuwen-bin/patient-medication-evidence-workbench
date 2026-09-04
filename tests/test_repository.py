@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -8,12 +9,66 @@ from medication_review_agent.repository import (
     AuditRedactionError,
     ReviewRepository,
     ReviewVersionConflict,
+    UnsupportedReviewSchema,
 )
+
+
+def test_repository_migrates_1_0_snapshot_in_memory(tmp_path: Path) -> None:
+    repository = ReviewRepository(tmp_path / "reviews.sqlite")
+    old = repository.create(
+        patient_ref="demo-1",
+        question="默认用药证据核查",
+    )
+    payload = old.model_dump(mode="json")
+    for field in (
+        "question",
+        "intent",
+        "writebackStatus",
+        "writebackJob",
+        "writebackError",
+        "modelCalls",
+        "retrievalAttempts",
+        "reinvestigationCounts",
+    ):
+        payload.pop(field)
+    payload["schemaVersion"] = "1.0"
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE reviews SET snapshot_json = ? WHERE review_id = ?",
+            (json.dumps(payload), old.reviewId),
+        )
+
+    migrated = repository.get(old.reviewId)
+
+    assert migrated.schemaVersion == "1.1"
+    assert migrated.question == "默认用药证据核查"
+    assert migrated.writebackStatus.value == "NOT_REQUESTED"
+    with sqlite3.connect(repository.path) as connection:
+        stored = json.loads(connection.execute(
+            "SELECT snapshot_json FROM reviews WHERE review_id = ?",
+            (old.reviewId,),
+        ).fetchone()[0])
+    assert stored["schemaVersion"] == "1.0"
+
+
+def test_repository_rejects_unknown_review_schema(tmp_path: Path) -> None:
+    repository = ReviewRepository(tmp_path / "reviews.sqlite")
+    snapshot = repository.create(patient_ref=None, question="核查用药")
+    raw = snapshot.model_dump(mode="json")
+    raw["schemaVersion"] = "2.0"
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE reviews SET snapshot_json = ? WHERE review_id = ?",
+            (json.dumps(raw), snapshot.reviewId),
+        )
+
+    with pytest.raises(UnsupportedReviewSchema):
+        repository.get(snapshot.reviewId)
 
 
 def test_stale_review_update_is_rejected(tmp_path: Path) -> None:
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    created = repository.create(patient_ref="FHIR:Patient/p1")
+    created = repository.create(patient_ref="FHIR:Patient/p1", question="默认用药证据核查")
     first = repository.get(created.reviewId)
     second = repository.get(created.reviewId)
     first.status = ReviewStatus.RUNNING
@@ -26,7 +81,10 @@ def test_stale_review_update_is_rejected(tmp_path: Path) -> None:
 
 def test_review_survives_repository_reopen(tmp_path: Path) -> None:
     path = tmp_path / "reviews.sqlite"
-    created = ReviewRepository(path).create(patient_ref="FHIR:Patient/p1")
+    created = ReviewRepository(path).create(
+        patient_ref="FHIR:Patient/p1",
+        question="默认用药证据核查",
+    )
     restored = ReviewRepository(path).get(created.reviewId)
     assert restored.patientRef == "FHIR:Patient/p1"
     assert restored.status == ReviewStatus.CREATED
@@ -35,7 +93,7 @@ def test_review_survives_repository_reopen(tmp_path: Path) -> None:
 def test_repository_releases_sqlite_file_after_each_operation(tmp_path: Path) -> None:
     path = tmp_path / "reviews.sqlite"
     repository = ReviewRepository(path)
-    created = repository.create(patient_ref="FHIR:Patient/p1")
+    created = repository.create(patient_ref="FHIR:Patient/p1", question="默认用药证据核查")
     repository.get(created.reviewId)
     path.unlink()
     assert not path.exists()
@@ -43,7 +101,7 @@ def test_repository_releases_sqlite_file_after_each_operation(tmp_path: Path) ->
 
 def test_audit_event_does_not_store_raw_patient_payload(tmp_path: Path) -> None:
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    review = repository.create(patient_ref="FHIR:Patient/p1")
+    review = repository.create(patient_ref="FHIR:Patient/p1", question="默认用药证据核查")
     repository.append_audit(
         review.reviewId,
         node="collect_review_context",
@@ -62,7 +120,7 @@ def test_audit_event_does_not_store_raw_patient_payload(tmp_path: Path) -> None:
 @pytest.mark.parametrize("unsafe_key", ["name", "birthDate", "content", "attachment", "dosage", "rawPayload"])
 def test_audit_rejects_sensitive_argument_keys(tmp_path: Path, unsafe_key: str) -> None:
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    review = repository.create(patient_ref="FHIR:Patient/p1")
+    review = repository.create(patient_ref="FHIR:Patient/p1", question="默认用药证据核查")
     with pytest.raises(AuditRedactionError):
         repository.append_audit(
             review.reviewId, node="n", tool="t", request_id="r",
@@ -73,7 +131,7 @@ def test_audit_rejects_sensitive_argument_keys(tmp_path: Path, unsafe_key: str) 
 
 def test_audit_rejects_patient_payload_hidden_under_innocuous_key(tmp_path: Path) -> None:
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    review = repository.create(patient_ref="FHIR:Patient/p1")
+    review = repository.create(patient_ref="FHIR:Patient/p1", question="默认用药证据核查")
     with pytest.raises(AuditRedactionError):
         repository.append_audit(
             review.reviewId, node="n", tool="t", request_id="r",
@@ -85,7 +143,7 @@ def test_audit_rejects_patient_payload_hidden_under_innocuous_key(tmp_path: Path
 
 def test_audit_event_with_same_mutation_id_is_idempotent(tmp_path: Path) -> None:
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    review = repository.create(patient_ref="FHIR:Patient/p1")
+    review = repository.create(patient_ref="FHIR:Patient/p1", question="默认用药证据核查")
     kwargs = dict(
         node="collect_review_context", tool="get_medication_review_context",
         request_id="r1", result_status="OK",
@@ -103,7 +161,7 @@ def test_audit_event_with_same_mutation_id_is_idempotent(tmp_path: Path) -> None
 def test_checkpoint_advanced_mutation_rolls_forward_after_repository_reopen(tmp_path: Path) -> None:
     path = tmp_path / "reviews.sqlite"
     repository = ReviewRepository(path)
-    review = repository.create(patient_ref="FHIR:Patient/p1")
+    review = repository.create(patient_ref="FHIR:Patient/p1", question="默认用药证据核查")
     repository.prepare_mutation(
         mutation_id="mutation-crash", review_id=review.reviewId,
         expected_version=0, action_fingerprint="f" * 64,
@@ -129,9 +187,51 @@ def test_checkpoint_advanced_mutation_rolls_forward_after_repository_reopen(tmp_
     assert restarted.get_mutation("mutation-crash")["state"] == "COMMITTED"
 
 
+def test_checkpoint_advanced_1_0_projection_migrates_before_commit(tmp_path: Path) -> None:
+    repository = ReviewRepository(tmp_path / "reviews.sqlite")
+    review = repository.create(
+        patient_ref="FHIR:Patient/p1",
+        question="原始核查问题",
+    )
+    repository.prepare_mutation(
+        mutation_id="legacy-projection",
+        review_id=review.reviewId,
+        expected_version=0,
+        action_fingerprint="f" * 64,
+        checkpoint_backup=b"durable-backup",
+    )
+    projected = review.model_copy(update={"status": ReviewStatus.RUNNING})
+    repository.mark_checkpoint_advanced("legacy-projection", projected)
+    legacy_payload = projected.model_dump(mode="json")
+    for field in (
+        "question",
+        "intent",
+        "writebackStatus",
+        "writebackJob",
+        "writebackError",
+        "modelCalls",
+        "retrievalAttempts",
+        "reinvestigationCounts",
+    ):
+        legacy_payload.pop(field)
+    legacy_payload["schemaVersion"] = "1.0"
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE mutation_journal SET projected_snapshot_json = ? WHERE mutation_id = ?",
+            (json.dumps(legacy_payload), "legacy-projection"),
+        )
+
+    recovered = repository.commit_mutation("legacy-projection")
+
+    assert recovered.schemaVersion == "1.1"
+    assert recovered.question == "默认用药证据核查"
+    assert recovered.version == 1
+    assert repository.get(review.reviewId).schemaVersion == "1.1"
+
+
 def test_identical_audit_results_in_distinct_call_slots_are_both_persisted(tmp_path: Path) -> None:
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    review = repository.create(patient_ref="FHIR:Patient/p1")
+    review = repository.create(patient_ref="FHIR:Patient/p1", question="默认用药证据核查")
     repository.prepare_mutation(
         mutation_id="mutation-1", review_id=review.reviewId, expected_version=0,
         action_fingerprint="f" * 64, checkpoint_backup=b"backup",

@@ -28,7 +28,12 @@ def _make_app(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("REVIEW_API_KEY", "test-secret")
     monkeypatch.setenv("REVIEW_API_REVIEWER_ID", "pharmacist-demo")
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    stale = repository.create(patient_ref="P001", review_id="review-1", as_of="2026-08-31")
+    stale = repository.create(
+        patient_ref="P001",
+        question="默认用药证据核查",
+        review_id="review-1",
+        as_of="2026-08-31",
+    )
     stale.status = ReviewStatus.RUNNING
     graph = GraphEvidenceProvenance.model_validate({
         "graphBackend": "neo4j",

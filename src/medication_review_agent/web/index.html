@@ -22,6 +22,8 @@
     <input id="patient-id" name="patientId" autocomplete="off" required>
     <label for="as-of">审核日期</label>
     <input id="as-of" name="asOf" type="date" required>
+    <label for="review-question">核查目标</label>
+    <input id="review-question" name="question" required minlength="3" maxlength="500" value="核查活动用药医嘱的成分、途径、剂型和标签警告">
     <label for="reviewer-id">审核药师</label>
     <input id="reviewer-id" name="reviewerId" autocomplete="username" required value="pharmacist-demo">
   </form>

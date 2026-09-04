@@ -25,6 +25,31 @@ class AuditRedactionError(ValueError):
     pass
 
 
+class UnsupportedReviewSchema(ValueError):
+    pass
+
+
+def migrate_review_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    version = str(payload.get("schemaVersion") or "1.0")
+    if version == "1.1":
+        return payload
+    if version != "1.0":
+        raise UnsupportedReviewSchema(f"Unsupported review schema: {version}")
+    migrated = dict(payload)
+    migrated.update({
+        "schemaVersion": "1.1",
+        "question": migrated.get("question") or "默认用药证据核查",
+        "intent": migrated.get("intent"),
+        "writebackStatus": migrated.get("writebackStatus") or "NOT_REQUESTED",
+        "writebackJob": migrated.get("writebackJob"),
+        "writebackError": migrated.get("writebackError"),
+        "modelCalls": migrated.get("modelCalls") or [],
+        "retrievalAttempts": migrated.get("retrievalAttempts") or {},
+        "reinvestigationCounts": migrated.get("reinvestigationCounts") or {},
+    })
+    return migrated
+
+
 _HASH_SUMMARY_KEYS = {"patientIdHash", "medicationIdHash", "productIdHash"}
 _COUNT_SUMMARY_KEYS = {"productCount", "topicCount", "claimCount", "medicationCount"}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -113,13 +138,14 @@ class ReviewRepository:
                 WHERE mutation_id IS NOT NULL AND audit_slot IS NOT NULL""")
 
     def create(
-        self, patient_ref: str | None, *, review_id: str | None = None,
+        self, patient_ref: str | None, *, question: str, review_id: str | None = None,
         as_of: str | None = None,
     ) -> ReviewSnapshot:
         now = datetime.now(UTC)
         snapshot = ReviewSnapshot(
             reviewId=review_id or str(uuid4()), status=ReviewStatus.CREATED,
-            patientRef=patient_ref, asOf=as_of, createdAt=now, updatedAt=now,
+            question=question, patientRef=patient_ref, asOf=as_of,
+            createdAt=now, updatedAt=now,
         )
         with self._connect() as connection:
             connection.execute(
@@ -136,7 +162,8 @@ class ReviewRepository:
             ).fetchone()
         if row is None:
             raise ReviewNotFound(review_id)
-        return ReviewSnapshot.model_validate_json(row["snapshot_json"])
+        payload = migrate_review_snapshot(json.loads(row["snapshot_json"]))
+        return ReviewSnapshot.model_validate(payload)
 
     def save(self, snapshot: ReviewSnapshot, *, expected_version: int) -> ReviewSnapshot:
         updated = snapshot.model_copy(deep=True)
@@ -273,7 +300,8 @@ class ReviewRepository:
             return self.get(row["review_id"])
         if row["state"] != "CHECKPOINT_ADVANCED" or not row["projected_snapshot_json"]:
             raise RuntimeError(f"Mutation {mutation_id} has not advanced its checkpoint")
-        projected = ReviewSnapshot.model_validate_json(row["projected_snapshot_json"])
+        projected_payload = migrate_review_snapshot(json.loads(row["projected_snapshot_json"]))
+        projected = ReviewSnapshot.model_validate(projected_payload)
         current = self.get(row["review_id"])
         if current.version == row["expected_version"]:
             projected = self.save(projected, expected_version=row["expected_version"])

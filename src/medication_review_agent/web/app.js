@@ -14,6 +14,7 @@ const nodes = {
   form: document.querySelector("#patient-form"),
   patientId: document.querySelector("#patient-id"),
   asOf: document.querySelector("#as-of"),
+  question: document.querySelector("#review-question"),
   run: document.querySelector("#run-review"),
   sign: document.querySelector("#sign-report"),
   status: document.querySelector("#review-status"),
@@ -189,6 +190,7 @@ async function loadReview(reviewId) {
     }
     nodes.patientId.value = state.review.patientRef || "";
     nodes.asOf.value = state.review.asOf || "";
+    nodes.question.value = state.review.question || nodes.question.value;
     state.selectedFindingId = state.review.findings?.[0]?.findingId || null;
     if (awaitingHuman.has(state.review.status) && window.matchMedia("(max-width: 920px)").matches) {
       setActiveTab("queue");
@@ -209,7 +211,11 @@ nodes.run.addEventListener("click", async () => {
   try {
     let review = state.review;
     if (!review) {
-      review = await createReview({ patientId: nodes.patientId.value.trim(), asOf: nodes.asOf.value });
+      review = await createReview({
+        patientId: nodes.patientId.value.trim(),
+        asOf: nodes.asOf.value,
+        question: nodes.question.value.trim(),
+      });
     }
     state.review = await runReview(review.reviewId);
     state.selectedFindingId = state.review.findings?.[0]?.findingId || null;

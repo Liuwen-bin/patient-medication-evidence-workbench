@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .gateways import DrugEvidenceGateway, HealthRecordGateway
 from .planner import DeterministicPlanner
@@ -72,6 +72,12 @@ class ApiProcessLease:
 class CreateReviewRequest(BaseModel):
     patientId: str | None = None
     asOf: str | None = None
+    question: str = Field(min_length=3, max_length=500)
+
+    @field_validator("question", mode="before")
+    @classmethod
+    def normalize_question(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
 
 class DecisionRequest(BaseModel):
@@ -277,7 +283,11 @@ def create_app(
 
     @app.post("/api/reviews", status_code=status.HTTP_201_CREATED)
     def create_review(body: CreateReviewRequest):
-        return dependencies.repository.create(patient_ref=body.patientId, as_of=body.asOf)
+        return dependencies.repository.create(
+            patient_ref=body.patientId,
+            as_of=body.asOf,
+            question=body.question,
+        )
 
     @app.post("/api/reviews/{review_id}/run")
     async def run_review(review_id: str):

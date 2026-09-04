@@ -123,7 +123,12 @@ def build_test_graph(tmp_path: Path, health: FakeHealthGateway, drug: FakeDrugGa
     try:
         repository.get(review_id)
     except KeyError:
-        repository.create(patient_ref="P001", review_id=review_id, as_of="2026-08-31")
+        repository.create(
+            patient_ref="P001",
+            question="默认用药证据核查",
+            review_id=review_id,
+            as_of="2026-08-31",
+        )
     dependencies = ReviewDependencies(health=health, drug=drug, repository=repository, planner=DeterministicPlanner())
     checkpointer = open_sqlite_checkpointer(tmp_path / "checkpoints.sqlite")
     return build_review_graph(dependencies, checkpointer)

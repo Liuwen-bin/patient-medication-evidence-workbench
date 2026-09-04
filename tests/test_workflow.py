@@ -23,7 +23,11 @@ MED2 = {"id": "med-2", "medication": "METFORMIN", "identifiers": [], "strength":
 
 
 def test_patient_candidates_survive_snapshot_projection() -> None:
-    existing = ReviewSnapshot(reviewId="review-1", status=ReviewStatus.RUNNING)
+    existing = ReviewSnapshot(
+        reviewId="review-1",
+        status=ReviewStatus.RUNNING,
+        question="默认用药证据核查",
+    )
     projected = state_to_snapshot(existing, {
         "status": ReviewStatus.AWAITING_PATIENT_CONFIRMATION.value,
         "candidates": [{"id": "p1", "patientNumber": "P001"}],

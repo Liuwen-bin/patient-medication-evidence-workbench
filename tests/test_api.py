@@ -14,15 +14,39 @@ from tests.fakes import FakeDrugGateway, FakeHealthGateway, health_context, mapp
 from tests.test_workflow import MED1
 
 
+DEFAULT_QUESTION = "默认用药证据核查"
+
+
 def test_create_run_and_read_review(client: TestClient) -> None:
-    created = client.post("/api/reviews", json={"patientId": "P001", "asOf": "2026-08-31"})
+    created = client.post("/api/reviews", json={
+        "patientId": "P001",
+        "asOf": "2026-08-31",
+        "question": "  核查活动用药医嘱的成分和标签警告  ",
+    })
     assert created.status_code == 201
+    assert created.json()["schemaVersion"] == "1.1"
+    assert created.json()["question"] == "核查活动用药医嘱的成分和标签警告"
     review_id = created.json()["reviewId"]
     run = client.post(f"/api/reviews/{review_id}/run")
     assert run.status_code == 200
     current = client.get(f"/api/reviews/{review_id}").json()
     assert current["status"] in {"AWAITING_MAPPING_CONFIRMATION", "AWAITING_FINDING_REVIEW"}
     assert current["version"] == 1
+
+
+def test_create_review_requires_question(client: TestClient) -> None:
+    response = client.post("/api/reviews", json={"patientId": "P001"})
+
+    assert response.status_code == 422
+
+
+def test_create_review_rejects_blank_question(client: TestClient) -> None:
+    response = client.post(
+        "/api/reviews",
+        json={"patientId": "P001", "question": "   "},
+    )
+
+    assert response.status_code == 422
 
 
 def test_stale_decision_returns_conflict(client: TestClient) -> None:
@@ -42,7 +66,9 @@ def test_unsigned_report_returns_conflict(client: TestClient) -> None:
 
 
 def test_audit_endpoint_returns_source_linked_events(client: TestClient) -> None:
-    created = client.post("/api/reviews", json={"patientId": "P001", "asOf": "2026-08-31"}).json()
+    created = client.post("/api/reviews", json={
+        "patientId": "P001", "asOf": "2026-08-31", "question": DEFAULT_QUESTION,
+    }).json()
     client.post(f"/api/reviews/{created['reviewId']}/run")
     events = client.get(f"/api/reviews/{created['reviewId']}/audit").json()
     assert events
@@ -94,7 +120,9 @@ def test_self_asserted_reviewer_cannot_override_api_key_identity(client: TestCli
 
 
 def test_decision_before_review_run_returns_conflict(client: TestClient) -> None:
-    created = client.post("/api/reviews", json={"patientId": "P001"}).json()
+    created = client.post("/api/reviews", json={
+        "patientId": "P001", "question": DEFAULT_QUESTION,
+    }).json()
     response = client.post(f"/api/reviews/{created['reviewId']}/decisions", json={
         "expectedVersion": 0, "action": "REJECT_FINDING",
         "findingId": "f1", "reviewerId": "pharmacist-demo",
@@ -103,7 +131,9 @@ def test_decision_before_review_run_returns_conflict(client: TestClient) -> None
 
 
 def test_concurrent_decisions_do_not_let_loser_overwrite_checkpoint(client: TestClient) -> None:
-    created = client.post("/api/reviews", json={"patientId": "P001", "asOf": "2026-08-31"}).json()
+    created = client.post("/api/reviews", json={
+        "patientId": "P001", "asOf": "2026-08-31", "question": DEFAULT_QUESTION,
+    }).json()
     review_id = created["reviewId"]
     run = client.post(f"/api/reviews/{review_id}/run").json()
     finding_ids = [item["findingId"] for item in run["findings"][:2]]
@@ -140,7 +170,9 @@ def test_concurrent_decisions_do_not_let_loser_overwrite_checkpoint(client: Test
 
 
 def test_cancel_requires_observed_version_and_persists_cancelled_enum(client: TestClient) -> None:
-    created = client.post("/api/reviews", json={"patientId": "P001"}).json()
+    created = client.post("/api/reviews", json={
+        "patientId": "P001", "question": DEFAULT_QUESTION,
+    }).json()
     review_id = created["reviewId"]
     assert client.post(f"/api/reviews/{review_id}/cancel", json={}).status_code == 422
     cancelled = client.post(f"/api/reviews/{review_id}/cancel", json={"expectedVersion": 0})
@@ -161,7 +193,9 @@ def test_repository_save_failure_restores_checkpoint_for_safe_retry(tmp_path: Pa
     app = create_app(dependencies, checkpoint_path=tmp_path / "checkpoints.sqlite")
     with TestClient(app, raise_server_exceptions=False) as isolated:
         isolated.headers.update({"x-api-key": "test-secret", "x-reviewer-id": "pharmacist-demo"})
-        created = isolated.post("/api/reviews", json={"patientId": "P001"}).json()
+        created = isolated.post("/api/reviews", json={
+            "patientId": "P001", "question": DEFAULT_QUESTION,
+        }).json()
         review_id = created["reviewId"]
         run = isolated.post(f"/api/reviews/{review_id}/run").json()
         finding_id = run["findings"][0]["findingId"]
@@ -186,7 +220,9 @@ def test_repository_save_failure_restores_checkpoint_for_safe_retry(tmp_path: Pa
 
 
 def test_signed_review_cannot_be_cancelled(client: TestClient) -> None:
-    created = client.post("/api/reviews", json={"patientId": "P001"}).json()
+    created = client.post("/api/reviews", json={
+        "patientId": "P001", "question": DEFAULT_QUESTION,
+    }).json()
     review_id = created["reviewId"]
     current = client.post(f"/api/reviews/{review_id}/run").json()
     decisions = [{"action": "ACCEPT_FINDING", "findingId": item["findingId"]} for item in current["findings"]]
@@ -225,7 +261,9 @@ def test_second_app_process_owner_cannot_share_checkpoint_path(tmp_path: Path, m
 
 
 def test_blocked_review_cannot_restart_in_same_checkpoint(client: TestClient) -> None:
-    created = client.post("/api/reviews", json={"patientId": "P001"}).json()
+    created = client.post("/api/reviews", json={
+        "patientId": "P001", "question": DEFAULT_QUESTION,
+    }).json()
     review_id = created["reviewId"]
     repository = client.app.state.graph  # confirms the app lifecycle is active
     assert repository is not None
@@ -239,7 +277,9 @@ def test_created_review_with_stale_checkpoint_is_rejected_without_importing_stat
     monkeypatch.setenv("REVIEW_API_KEY", "test-secret")
     monkeypatch.setenv("REVIEW_API_REVIEWER_ID", "pharmacist-demo")
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    created = repository.create(patient_ref="P001", review_id="review-stale")
+    created = repository.create(
+        patient_ref="P001", question=DEFAULT_QUESTION, review_id="review-stale",
+    )
     checkpoint_path = tmp_path / "checkpoints.sqlite"
     dependencies = ReviewDependencies(
         health=FakeHealthGateway(health_context(MED1)),
@@ -273,7 +313,9 @@ def test_failed_decision_retry_does_not_duplicate_audit_events(tmp_path: Path, m
     app = create_app(dependencies, checkpoint_path=tmp_path / "checkpoints.sqlite")
     with TestClient(app, raise_server_exceptions=False) as isolated:
         isolated.headers.update({"x-api-key": "test-secret", "x-reviewer-id": "pharmacist-demo"})
-        created = isolated.post("/api/reviews", json={"patientId": "P001"}).json()
+        created = isolated.post("/api/reviews", json={
+            "patientId": "P001", "question": DEFAULT_QUESTION,
+        }).json()
         review_id = created["reviewId"]
         run = isolated.post(f"/api/reviews/{review_id}/run").json()
         finding_id = run["findings"][0]["findingId"]
@@ -316,7 +358,9 @@ def test_checkpoint_advanced_crash_recovers_after_app_restart(tmp_path: Path, mo
     first = create_app(dependencies, checkpoint_path=checkpoint_path)
     with TestClient(first) as client:
         client.headers.update({"x-api-key": "test-secret", "x-reviewer-id": "pharmacist-demo"})
-        created = client.post("/api/reviews", json={"patientId": "P001"}).json()
+        created = client.post("/api/reviews", json={
+            "patientId": "P001", "question": DEFAULT_QUESTION,
+        }).json()
         review_id = created["reviewId"]
         running = client.post(f"/api/reviews/{review_id}/run").json()
         finding_id = running["findings"][0]["findingId"]
@@ -381,7 +425,10 @@ def test_cancel_recovers_checkpoint_advanced_decision_before_version_check(tmp_p
     monkeypatch.setenv("REVIEW_API_KEY", "test-secret")
     monkeypatch.setenv("REVIEW_API_REVIEWER_ID", "pharmacist-demo")
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    review = repository.create(patient_ref="P001", review_id="recover-before-cancel")
+    review = repository.create(
+        patient_ref="P001", question=DEFAULT_QUESTION,
+        review_id="recover-before-cancel",
+    )
     review.status = ReviewStatus.AWAITING_FINDING_REVIEW
     repository.save(review, expected_version=0)
     projected = repository.get(review.reviewId)
@@ -413,7 +460,10 @@ def test_run_recovers_owned_journal_before_orphan_checkpoint_rejection(tmp_path:
     monkeypatch.setenv("REVIEW_API_KEY", "test-secret")
     monkeypatch.setenv("REVIEW_API_REVIEWER_ID", "pharmacist-demo")
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
-    review = repository.create(patient_ref="P001", review_id=f"owned-{journal_state.lower()}")
+    review = repository.create(
+        patient_ref="P001", question=DEFAULT_QUESTION,
+        review_id=f"owned-{journal_state.lower()}",
+    )
     checkpoint_path = tmp_path / "checkpoints.sqlite"
     payload = {"action": "RUN", "patientRef": "P001", "asOf": None}
     import hashlib, json, base64, pickle

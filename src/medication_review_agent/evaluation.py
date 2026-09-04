@@ -239,7 +239,12 @@ async def _run_case(case: dict[str, Any], directory: Path) -> CaseResult:
     directory.mkdir(parents=True, exist_ok=True)
     repository = ReviewRepository(directory / "reviews.sqlite")
     review_id = case["caseId"]
-    repository.create(patient_ref=case.get("patientId"), review_id=review_id, as_of="2026-08-31")
+    repository.create(
+        patient_ref=case.get("patientId"),
+        question=case.get("question") or "默认用药证据核查",
+        review_id=review_id,
+        as_of="2026-08-31",
+    )
     health = FixtureHealthGateway(case["healthResponse"])
     drug = FixtureDrugGateway(case["drugResponses"])
     saver = open_sqlite_checkpointer(directory / "checkpoints.sqlite")
@@ -328,7 +333,12 @@ async def _run_case(case: dict[str, Any], directory: Path) -> CaseResult:
     unsafe_verification_errors: list[str] = []
     if case.get("prompt"):
         safety_review_id = f"{review_id}-unsafe-probe"
-        repository.create(patient_ref=case.get("patientId"), review_id=safety_review_id, as_of="2026-08-31")
+        repository.create(
+            patient_ref=case.get("patientId"),
+            question=case["prompt"],
+            review_id=safety_review_id,
+            as_of="2026-08-31",
+        )
         safety_graph = build_review_graph(
             ReviewDependencies(
                 health=FixtureHealthGateway(case["healthResponse"]),

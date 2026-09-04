@@ -32,6 +32,67 @@ class ReviewStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class ReviewTopic(str, Enum):
+    IDENTITY = "identity"
+    INGREDIENTS = "ingredients"
+    ROUTE = "route"
+    DOSAGE_FORM = "dosage_form"
+    WARNINGS = "warnings"
+    DOSAGE = "dosage"
+    STORAGE = "storage"
+    INDICATIONS = "indications"
+    PREGNANCY = "pregnancy"
+    STOP_USE = "stop_use"
+    IMAGES = "images"
+
+
+class ReviewIntent(ContractModel):
+    type: Literal["MEDICATION_EVIDENCE_REVIEW"] = "MEDICATION_EVIDENCE_REVIEW"
+    topics: list[ReviewTopic]
+    requiresNarrativeEvidence: bool
+    rationale: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    modelId: str | None = None
+    promptVersion: str
+
+
+class WritebackStatus(str, Enum):
+    NOT_REQUESTED = "NOT_REQUESTED"
+    PREPARING = "PREPARING"
+    PREPARED = "PREPARED"
+    COMMITTING = "COMMITTING"
+    COMMITTED = "COMMITTED"
+    FAILED = "FAILED"
+
+
+class ModelCallRecord(ContractModel):
+    modelId: str
+    promptVersion: str
+    inputTokens: int = Field(ge=0)
+    outputTokens: int = Field(ge=0)
+    estimatedCost: float = Field(ge=0.0)
+    latencyMs: int = Field(ge=0)
+    fallback: bool = False
+    failureCode: str | None = None
+
+
+class WritebackFailure(ContractModel):
+    code: str
+    message: str
+    retryable: bool
+
+
+class WritebackJob(ContractModel):
+    jobId: str
+    reviewVersion: int = Field(ge=0)
+    bundleHash: str
+    expectedVersion: int = Field(ge=0)
+    resources: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    blockedFindings: list[dict[str, Any]] = Field(default_factory=list)
+    result: dict[str, Any] | None = None
+
+
 class FindingStatus(str, Enum):
     PENDING = "PENDING"
     ACCEPTED = "ACCEPTED"
@@ -177,10 +238,12 @@ class RunMetrics(ContractModel):
 
 class ReviewSnapshot(ContractModel):
     reviewId: str
-    schemaVersion: Literal["1.0"] = "1.0"
+    schemaVersion: Literal["1.1"] = "1.1"
     status: ReviewStatus
+    question: str
     patientRef: str | None = None
     asOf: str | None = None
+    intent: ReviewIntent | None = None
     candidates: list[dict[str, Any]] = Field(default_factory=list)
     contextSnapshot: dict[str, Any] = Field(default_factory=dict)
     contextMissingFields: list[str] = Field(default_factory=list)
@@ -193,6 +256,12 @@ class ReviewSnapshot(ContractModel):
     humanDecisions: list[HumanDecision] = Field(default_factory=list)
     auditEvents: list[AuditEvent] = Field(default_factory=list)
     metrics: RunMetrics = Field(default_factory=RunMetrics)
+    writebackStatus: WritebackStatus = WritebackStatus.NOT_REQUESTED
+    writebackJob: WritebackJob | None = None
+    writebackError: WritebackFailure | None = None
+    modelCalls: list[ModelCallRecord] = Field(default_factory=list)
+    retrievalAttempts: dict[str, int] = Field(default_factory=dict)
+    reinvestigationCounts: dict[str, int] = Field(default_factory=dict)
     version: int = Field(default=0, ge=0)
     createdAt: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updatedAt: datetime = Field(default_factory=lambda: datetime.now(UTC))

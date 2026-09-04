@@ -14,7 +14,8 @@ from medication_review_agent.report import (
 def signed_review_snapshot() -> ReviewSnapshot:
     now = datetime.now(UTC)
     return ReviewSnapshot(
-        reviewId="r1", patientRef="FHIR:Patient/p1", asOf="2026-08-31",
+        reviewId="r1", question="默认用药证据核查",
+        patientRef="FHIR:Patient/p1", asOf="2026-08-31",
         status=ReviewStatus.SIGNED_OFF, createdAt=now, updatedAt=now,
         medications=[MedicationRecord(medicationId="m1", name="METFORMIN <script>", patientEvidenceRefs=["FHIR:MedicationRequest/m1"])],
         medicationMappings=[MedicationMapping(medicationId="m1", sourceName="METFORMIN <script>", matchClass="UNMAPPED")],

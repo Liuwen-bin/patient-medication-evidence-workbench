@@ -75,6 +75,29 @@ def _mock_review(page: Page, snapshot: dict, on_post=None, audit=None) -> None:
     ))
 
 
+def test_start_review_sends_question(page: Page, live_server_url: str) -> None:
+    snapshot = _review(status="AWAITING_FINDING_REVIEW")
+    page.route("**/api/reviews", lambda route: route.fulfill(
+        status=201,
+        content_type="application/json",
+        body=json.dumps(snapshot),
+    ))
+    page.route("**/api/reviews/review-ui/run", lambda route: route.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps(snapshot),
+    ))
+    page.goto(live_server_url)
+    page.fill("#patient-id", "P001")
+    page.fill("#as-of", "2026-08-31")
+    page.fill("#review-question", "核查成分、途径和标签警告")
+
+    with page.expect_request("**/api/reviews") as request:
+        page.get_by_role("button", name="开始复核").click()
+
+    assert request.value.post_data_json["question"] == "核查成分、途径和标签警告"
+
+
 def test_ambiguous_mapping_requires_explicit_candidate_selection(
     page: Page, live_server_url: str
 ) -> None:

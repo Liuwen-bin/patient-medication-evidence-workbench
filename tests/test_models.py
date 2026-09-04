@@ -11,6 +11,7 @@ from medication_review_agent.models import (
     ReviewSnapshot,
     ReviewStatus,
     ToolEnvelope,
+    WritebackStatus,
 )
 
 
@@ -82,6 +83,7 @@ def test_snapshot_round_trip_preserves_graph_provenance() -> None:
     now = datetime.now(UTC)
     snapshot = ReviewSnapshot(
         reviewId="r1",
+        question="默认用药证据核查",
         patientRef="FHIR:Patient/p1",
         status=ReviewStatus.CREATED,
         createdAt=now,
@@ -103,3 +105,16 @@ def test_snapshot_round_trip_preserves_graph_provenance() -> None:
 
 def test_signed_off_is_a_distinct_terminal_status() -> None:
     assert ReviewStatus.SIGNED_OFF.value == "SIGNED_OFF"
+
+
+def test_new_snapshot_uses_review_schema_1_1() -> None:
+    snapshot = ReviewSnapshot(
+        reviewId="review-1",
+        status=ReviewStatus.CREATED,
+        question="核查成分和标签警告",
+    )
+    assert snapshot.schemaVersion == "1.1"
+    assert snapshot.writebackStatus is WritebackStatus.NOT_REQUESTED
+    assert snapshot.intent is None
+    assert snapshot.writebackJob is None
+    assert snapshot.writebackError is None
