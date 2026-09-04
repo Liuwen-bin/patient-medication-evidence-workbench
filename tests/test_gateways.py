@@ -43,6 +43,35 @@ async def test_health_gateway_uses_structured_context_tool() -> None:
 
 
 @pytest.mark.asyncio
+async def test_health_gateway_calls_preview_with_payload() -> None:
+    caller = FakeCaller({
+        "validate_medication_review_writeback": envelope(data={"jobId": "job-1"})
+    })
+    gateway = HealthRecordGateway(caller)
+
+    await gateway.validate_writeback({"schemaVersion": "1.0", "reviewId": "review-1"})
+
+    assert caller.calls == [("validate_medication_review_writeback", {
+        "payload": {"schemaVersion": "1.0", "reviewId": "review-1"}
+    })]
+
+
+@pytest.mark.asyncio
+async def test_health_gateway_commit_preserves_confirmation_fields() -> None:
+    caller = FakeCaller({"commit_medication_review_writeback": envelope()})
+    gateway = HealthRecordGateway(caller)
+
+    await gateway.commit_writeback("job-1", "a" * 64, 7, True)
+
+    assert caller.calls == [("commit_medication_review_writeback", {
+        "jobId": "job-1",
+        "bundleHash": "a" * 64,
+        "expectedVersion": 7,
+        "confirmed": True,
+    })]
+
+
+@pytest.mark.asyncio
 async def test_drug_gateway_preserves_unmapped_status() -> None:
     caller = FakeCaller({
         "resolve_medication": envelope("UNMAPPED", {"selectedProductId": None})

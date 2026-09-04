@@ -97,6 +97,28 @@ class HealthRecordGateway(_Gateway):
             "get_medication_review_context", {"patientId": patient_id, "asOf": as_of}
         )
 
+    async def validate_writeback(self, payload: dict[str, Any]) -> TimedToolResult:
+        return await self._call(
+            "validate_medication_review_writeback", {"payload": payload}
+        )
+
+    async def commit_writeback(
+        self,
+        job_id: str,
+        bundle_hash: str,
+        expected_version: int,
+        confirmed: bool,
+    ) -> TimedToolResult:
+        return await self._call(
+            "commit_medication_review_writeback",
+            {
+                "jobId": job_id,
+                "bundleHash": bundle_hash,
+                "expectedVersion": expected_version,
+                "confirmed": confirmed,
+            },
+        )
+
 
 class DrugEvidenceGateway(_Gateway):
     @classmethod
