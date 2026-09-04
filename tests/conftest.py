@@ -66,6 +66,7 @@ def _make_app(tmp_path: Path, monkeypatch):
     stale.findings = [Finding.model_validate({
         "findingId": "finding-1",
         "reviewType": "LABEL_PRECAUTION",
+        "ruleId": "label-precaution-v1",
         "summary": "核对标签注意事项",
         "attentionLevel": "MEDIUM",
         "confidence": 0.92,

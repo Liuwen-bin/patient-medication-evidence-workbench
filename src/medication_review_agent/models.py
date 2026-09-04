@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import Enum
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -179,6 +180,9 @@ class EvidenceItem(ContractModel):
 class Finding(ContractModel):
     findingId: str
     reviewType: str
+    ruleId: str
+    normalizationVersion: str | None = None
+    comparisonInputs: dict[str, Any] = Field(default_factory=dict)
     summary: str
     attentionLevel: str
     confidence: float = Field(ge=0.0, le=1.0)
@@ -199,6 +203,17 @@ class Finding(ContractModel):
         if not self.patientEvidenceRefs or not self.labelEvidenceRefs:
             raise ValueError("accepted findings require patient and label evidence")
         return self
+
+
+def migrate_finding_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    migrated = dict(payload)
+    if not migrated.get("ruleId"):
+        review_type = str(migrated.get("reviewType") or "finding")
+        slug = re.sub(r"[^a-z0-9]+", "-", review_type.casefold()).strip("-")
+        migrated["ruleId"] = f"legacy-{slug or 'finding'}-v1"
+    migrated.setdefault("normalizationVersion", None)
+    migrated.setdefault("comparisonInputs", {})
+    return migrated
 
 
 class HumanDecision(ContractModel):
@@ -228,6 +243,7 @@ class AuditEvent(ContractModel):
     inputTokens: int = Field(default=0, ge=0)
     outputTokens: int = Field(default=0, ge=0)
     estimatedCost: float = Field(default=0.0, ge=0.0)
+    modelFallback: bool = False
 
 
 class RunMetrics(ContractModel):

@@ -5,80 +5,31 @@ import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any
 from uuid import uuid4
 
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
-from pydantic import BaseModel, Field, TypeAdapter
-
 from .gateways import DrugEvidenceGateway, HealthRecordGateway, TimedToolResult, ToolContractError
 from .models import (
     EvidenceItem, Finding, FindingStatus, GraphEvidenceProvenance, HumanDecision,
-    MedicationMapping, MedicationRecord, ReviewPlanItem, ReviewSnapshot, ReviewStatus,
+    MedicationMapping, MedicationRecord, ReviewIntent, ReviewPlanItem, ReviewSnapshot,
+    ReviewStatus, ReviewTopic, migrate_finding_payload,
 )
 from .planner import ReviewPlanner
 from .repository import ReviewRepository
 from .safety import evaluate_review_question
 from .verifier import apply_verification
-
-
-class ReviewState(TypedDict, total=False):
-    mutationId: str
-    reviewId: str
-    schemaVersion: str
-    status: str
-    question: str
-    questionSafety: dict[str, Any]
-    patientRef: str | None
-    asOf: str | None
-    contextSnapshot: dict[str, Any]
-    contextMissingFields: list[str]
-    medications: list[dict[str, Any]]
-    medicationMappings: list[dict[str, Any]]
-    reviewPlan: list[dict[str, Any]]
-    findings: list[dict[str, Any]]
-    evidenceIndex: list[dict[str, Any]]
-    unresolvedItems: list[dict[str, Any]]
-    humanDecisions: list[dict[str, Any]]
-    auditEvents: list[dict[str, Any]]
-    metrics: dict[str, Any]
-    candidates: list[dict[str, Any]]
-    reinvestigateFindingIds: list[str]
-    contextMedicationsChanged: bool
-    contextChangedMedicationIds: list[str]
-
-
-class PatientConfirmation(BaseModel):
-    action: Literal["CONFIRM_PATIENT"]
-    patientId: str
-    reviewerId: str
-
-
-class MappingConfirmation(BaseModel):
-    action: Literal["CONFIRM_MAPPING"]
-    medicationId: str
-    productId: str
-    reviewerId: str
-
-
-class FindingDecision(BaseModel):
-    action: Literal["ACCEPT_FINDING", "REJECT_FINDING", "REQUEST_MORE_EVIDENCE"]
-    findingId: str
-    note: str | None = None
-
-
-class CompleteFindingReview(BaseModel):
-    action: Literal["COMPLETE_FINDING_REVIEW"]
-    reviewerId: str
-    decisions: list[FindingDecision] = Field(default_factory=list)
-
-
-class FinalSignOff(BaseModel):
-    action: Literal["SIGN_OFF"]
-    reviewerId: str
+from .workflow_state import (
+    CompleteFindingReview,
+    FinalSignOff,
+    FindingDecision,
+    MappingConfirmation,
+    PatientConfirmation,
+    ReviewState,
+)
 
 
 @dataclass(frozen=True)
@@ -117,6 +68,108 @@ def _graph_warnings(provenance: GraphEvidenceProvenance | None) -> list[str]:
     if status == "UNAVAILABLE" and "graph_fallback_used" not in warnings:
         warnings.append("graph_consistency_unavailable")
     return warnings
+
+
+def deidentified_patient_features(context: dict[str, Any]) -> dict[str, Any]:
+    patient = context.get("patient") or {}
+    try:
+        age = float(patient["age"])
+    except (KeyError, TypeError, ValueError):
+        age_band = "unknown"
+    else:
+        age_band = "child" if age < 18 else "adult" if age < 65 else "older_adult"
+    allergy_terms: set[str] = set()
+    for item in context.get("allergies") or []:
+        if not isinstance(item, dict):
+            continue
+        value = item.get("substance") or item.get("name")
+        if isinstance(value, str) and value.strip():
+            allergy_terms.add(value.strip())
+    return {
+        "ageBand": age_band,
+        "allergyTerms": sorted(allergy_terms),
+        "specialPopulationFlags": sorted(
+            item.strip()
+            for item in context.get("specialPopulations") or []
+            if isinstance(item, str) and item.strip()
+        ),
+    }
+
+
+def relevant_missing_fields(
+    topics: list[ReviewTopic], missing_fields: list[str],
+) -> list[str]:
+    topic_values = {topic.value for topic in topics}
+
+    def relevant(field: str) -> bool:
+        return (
+            (ReviewTopic.WARNINGS.value in topic_values and field == "allergies")
+            or (ReviewTopic.ROUTE.value in topic_values and field.endswith(".route"))
+            or (
+                ReviewTopic.DOSAGE_FORM.value in topic_values
+                and field.endswith(".dosageForm")
+            )
+            or (ReviewTopic.DOSAGE.value in topic_values and field.endswith(".dosage"))
+            or (
+                ReviewTopic.PREGNANCY.value in topic_values
+                and field == "specialPopulations"
+            )
+        )
+
+    return sorted({field for field in missing_fields if relevant(field)})
+
+
+def bind_review_plan(
+    intent: ReviewIntent,
+    mappings: list[MedicationMapping],
+    missing_fields: list[str],
+) -> list[ReviewPlanItem]:
+    medication_ids = [item.medicationId for item in mappings]
+    items = [
+        ReviewPlanItem(
+            planItemId=f"topic-{topic.value}",
+            reviewType=topic.value.upper(),
+            medicationIds=medication_ids,
+            topics=[topic.value],
+            rationale=intent.rationale,
+        )
+        for topic in intent.topics
+    ]
+    items.extend(
+        ReviewPlanItem(
+            planItemId=f"missing-{_digest(field)[:16]}",
+            reviewType="EVIDENCE_GAP",
+            medicationIds=medication_ids,
+            topics=[],
+            rationale=f"Patient information is not recorded: {field}.",
+            requiresHumanReview=True,
+            missingField=field,
+        )
+        for field in missing_fields
+    )
+    return items
+
+
+def make_finding(
+    *,
+    rule_id: str,
+    normalization_version: str | None = None,
+    comparison_inputs: dict[str, Any] | None = None,
+    **values: Any,
+) -> Finding:
+    return Finding(
+        ruleId=rule_id,
+        normalizationVersion=normalization_version,
+        comparisonInputs=comparison_inputs or {},
+        **values,
+    )
+
+
+def _normalized_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(str(value).casefold().split())
+    return normalized or None
 
 
 async def _retry(operation):
@@ -376,6 +429,13 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             medication = medications.get(mapping["medicationId"], {})
             finding.update({
                 "reviewType": "LABEL_EVIDENCE_REVIEW",
+                "ruleId": "label-evidence-review-v1",
+                "normalizationVersion": "normalization-v1",
+                "comparisonInputs": {
+                    "recordedRoute": _normalized_text(medication.get("route")),
+                    "recordedDosageForm": _normalized_text(medication.get("dosageForm")),
+                    "recordedDosage": _normalized_text(medication.get("dosage")),
+                },
                 "summary": f"Review retrieved label evidence for {mapping['sourceName']}.",
                 "selectedProductIds": [mapping["selectedProductId"]],
                 "patientEvidenceRefs": medication.get("patientEvidenceRefs", []),
@@ -384,16 +444,75 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             })
         return findings
 
-    async def plan_review(state: ReviewState) -> dict[str, Any]:
+    async def parse_review_goal(state: ReviewState) -> dict[str, Any]:
         context = state.get("contextSnapshot") or {}
-        features = {"age": (context.get("patient") or {}).get("age"), "allergies": context.get("allergies") or [], "specialPopulations": context.get("specialPopulations") or []}
+        mappings = [
+            MedicationMapping.model_validate(item)
+            for item in state.get("medicationMappings", [])
+        ]
         planning = await dependencies.planner.plan(
             state.get("question") or "默认用药证据核查",
-            features,
-            [MedicationMapping.model_validate(item) for item in state.get("medicationMappings", [])],
+            deidentified_patient_features(context),
+            mappings,
             state.get("contextMissingFields", []),
         )
-        return {"reviewPlan": [item.model_dump(mode="json") for item in planning.items]}
+        model_call = planning.modelCall
+        dependencies.repository.append_audit(
+            state["reviewId"],
+            node="parse_review_goal",
+            tool=None,
+            request_id=None,
+            result_status="MODEL_FALLBACK" if planning.modelFallback else "OK",
+            argument_summary={
+                "topicCount": len(planning.intent.topics),
+                "medicationCount": len(mappings),
+            },
+            evidence_refs=[],
+            latency_ms=model_call.latencyMs if model_call else 0,
+            model_id=model_call.modelId if model_call else planning.intent.modelId,
+            prompt_version=(
+                model_call.promptVersion if model_call else planning.intent.promptVersion
+            ),
+            input_tokens=model_call.inputTokens if model_call else 0,
+            output_tokens=model_call.outputTokens if model_call else 0,
+            estimated_cost=model_call.estimatedCost if model_call else 0.0,
+            model_fallback=planning.modelFallback,
+            mutation_id=state.get("mutationId"),
+            audit_slot="parse_review_goal",
+        )
+        metrics = dict(state.get("metrics") or {})
+        if model_call:
+            metrics["inputTokens"] = metrics.get("inputTokens", 0) + model_call.inputTokens
+            metrics["outputTokens"] = metrics.get("outputTokens", 0) + model_call.outputTokens
+            metrics["estimatedCost"] = (
+                metrics.get("estimatedCost", 0.0) + model_call.estimatedCost
+            )
+        return {
+            "intent": planning.intent.model_dump(mode="json"),
+            "reviewPlan": [item.model_dump(mode="json") for item in planning.items],
+            "modelCalls": [
+                *(state.get("modelCalls") or []),
+                *([model_call.model_dump(mode="json")] if model_call else []),
+            ],
+            "metrics": metrics,
+        }
+
+    def plan_review(state: ReviewState) -> dict[str, Any]:
+        intent = ReviewIntent.model_validate(state["intent"])
+        mappings = [
+            MedicationMapping.model_validate(item)
+            for item in state.get("medicationMappings", [])
+        ]
+        missing_fields = relevant_missing_fields(
+            intent.topics,
+            state.get("contextMissingFields", []),
+        )
+        return {
+            "reviewPlan": [
+                item.model_dump(mode="json")
+                for item in bind_review_plan(intent, mappings, missing_fields)
+            ],
+        }
 
     async def retrieve_evidence(state: ReviewState) -> dict[str, Any]:
         selected = [item["selectedProductId"] for item in state.get("medicationMappings", []) if item.get("selectedProductId")]
@@ -485,14 +604,26 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
 
     def build_findings(state: ReviewState) -> dict[str, Any]:
         medications = {item["medicationId"]: MedicationRecord.model_validate(item) for item in state.get("medications", [])}
-        findings = [Finding(
+        planned_missing_fields = [
+            item["missingField"]
+            for item in state.get("reviewPlan", [])
+            if item.get("reviewType") == "EVIDENCE_GAP" and item.get("missingField")
+        ]
+        findings = [make_finding(
+            rule_id="missing-patient-field-v1",
+            comparison_inputs={"missingField": missing_field},
             findingId=str(uuid4()), reviewType="EVIDENCE_GAP",
             summary=f"Patient information is not recorded: {missing_field}.",
             attentionLevel="HIGH", confidence=1.0, requiresHumanReview=True,
             missingField=missing_field,
-        ).model_dump(mode="json") for missing_field in state.get("contextMissingFields", [])]
+        ).model_dump(mode="json") for missing_field in planned_missing_fields]
         for gap in [item for item in state.get("unresolvedItems", []) if item.get("kind") == "EVIDENCE_GAP"]:
-            findings.append(Finding(
+            findings.append(make_finding(
+                rule_id="drug-evidence-gap-v1",
+                comparison_inputs={
+                    "sourceTool": gap.get("sourceTool"),
+                    "productIds": sorted(gap.get("productIds", [])),
+                },
                 findingId=str(uuid4()), reviewType="EVIDENCE_GAP",
                 summary=str(gap.get("summary") or "Drug evidence is insufficient."),
                 attentionLevel="HIGH", confidence=1.0,
@@ -514,7 +645,13 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             if identity in provenance_gaps:
                 continue
             provenance_gaps.add(identity)
-            findings.append(Finding(
+            findings.append(make_finding(
+                rule_id="graph-provenance-review-v1",
+                comparison_inputs={
+                    "graphBackend": provenance.graphBackend,
+                    "fallbackUsed": provenance.fallbackUsed,
+                    "consistencyStatus": consistency,
+                },
                 findingId=str(uuid4()), reviewType="EVIDENCE_GAP",
                 summary="Drug evidence graph provenance requires pharmacist review.",
                 attentionLevel="HIGH", confidence=1.0, requiresHumanReview=True,
@@ -538,7 +675,9 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             ]))
             finding_provenance = next((item for item in evidence_provenances if _graph_warnings(item)), mapping.graphProvenance)
             if not mapping.selectedProductId:
-                findings.append(Finding(
+                findings.append(make_finding(
+                    rule_id="unmapped-medication-v1",
+                    comparison_inputs={"medicationId": mapping.medicationId},
                     findingId=str(uuid4()), reviewType="EVIDENCE_GAP",
                     summary=f"No DailyMed product was mapped for {mapping.sourceName}.",
                     attentionLevel="HIGH", confidence=1.0, medicationIds=[mapping.medicationId],
@@ -546,7 +685,17 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                     requiresHumanReview=True,
                 ).model_dump(mode="json"))
                 continue
-            findings.append(Finding(
+            findings.append(make_finding(
+                rule_id="label-evidence-review-v1",
+                normalization_version="normalization-v1",
+                comparison_inputs={
+                    "recordedRoute": _normalized_text(medication.route),
+                    "recordedDosageForm": _normalized_text(medication.dosageForm),
+                    "recordedDosage": _normalized_text(medication.dosage),
+                    "allergyTerms": deidentified_patient_features(
+                        state.get("contextSnapshot") or {}
+                    )["allergyTerms"],
+                },
                 findingId=str(uuid4()), reviewType="LABEL_EVIDENCE_REVIEW",
                 summary=f"Review retrieved label evidence for {mapping.sourceName}.",
                 attentionLevel="HIGH" if warnings else "MEDIUM", confidence=0.8,
@@ -556,7 +705,9 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                 graphProvenance=finding_provenance,
             ).model_dump(mode="json"))
             if warnings:
-                findings.append(Finding(
+                findings.append(make_finding(
+                    rule_id="graph-provenance-review-v1",
+                    comparison_inputs={"medicationId": mapping.medicationId},
                     findingId=str(uuid4()), reviewType="EVIDENCE_GAP",
                     summary="Graph provenance requires pharmacist review.", attentionLevel="HIGH",
                     confidence=1.0, medicationIds=[mapping.medicationId],
@@ -566,7 +717,18 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                 ).model_dump(mode="json"))
         for comparison in [item for item in state.get("evidenceIndex", []) if item.get("source") == "SPL-GRAPH" and item.get("topic") == "shared_active_ingredients"]:
             provenance = comparison.get("graphProvenance")
-            findings.append(Finding(
+            shared_ingredients = comparison.get("sharedActiveIngredients", [])
+            findings.append(make_finding(
+                rule_id="shared-active-ingredient-v1",
+                normalization_version="normalization-v1",
+                comparison_inputs={
+                    "productIds": sorted(comparison.get("productIds", [])),
+                    "sharedActiveIngredientIds": sorted(
+                        str(item.get("entityId"))
+                        for item in shared_ingredients
+                        if isinstance(item, dict) and item.get("entityId")
+                    ),
+                },
                 findingId=str(uuid4()), reviewType="DUPLICATE_ACTIVE_INGREDIENT",
                 summary=f"Mapped products share active ingredient graph entities: {comparison.get('summary')}.",
                 attentionLevel="HIGH", confidence=1.0,
@@ -575,7 +737,7 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                 patientEvidenceRefs=[ref for item in medications.values() for ref in item.patientEvidenceRefs],
                 labelEvidenceRefs=[comparison["evidenceRef"]] if str(comparison.get("evidenceRef", "")).startswith("SPL:") else [],
                 requiresHumanReview=True, graphProvenance=provenance,
-                sharedActiveIngredients=comparison.get("sharedActiveIngredients", []),
+                sharedActiveIngredients=shared_ingredients,
             ).model_dump(mode="json"))
         changed_ids = set(state.get("contextChangedMedicationIds") or [])
         if changed_ids:
@@ -631,22 +793,20 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             medication_id for medication_id in set(old_medications) & set(new_medications)
             if old_medications[medication_id] == new_medications[medication_id]
         })
-        features = {
-            "age": (context.get("patient") or {}).get("age"),
-            "allergies": context.get("allergies") or [],
-            "specialPopulations": context.get("specialPopulations") or [],
-        }
-        planning = await dependencies.planner.plan(
-            state.get("question") or "默认用药证据核查",
-            features,
-            [MedicationMapping.model_validate(item) for item in state.get("medicationMappings", [])],
-            list(missing),
-        )
+        intent = ReviewIntent.model_validate(state["intent"])
+        mappings = [
+            MedicationMapping.model_validate(item)
+            for item in state.get("medicationMappings", [])
+        ]
+        relevant_missing = relevant_missing_fields(intent.topics, list(missing))
         return {
             "contextSnapshot": context,
             "contextMissingFields": list(missing),
             "medications": medications,
-            "reviewPlan": [item.model_dump(mode="json") for item in planning.items],
+            "reviewPlan": [
+                item.model_dump(mode="json")
+                for item in bind_review_plan(intent, mappings, relevant_missing)
+            ],
             "findings": findings, "reinvestigateFindingIds": [], "metrics": metrics,
             "contextMedicationsChanged": medications_changed,
             "contextChangedMedicationIds": changed_ids,
@@ -854,6 +1014,16 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                 findings.append(current)
             current["reviewType"] = "DUPLICATE_ACTIVE_INGREDIENT"
             current["sourceTool"] = "compare_product_ingredients"
+            current["ruleId"] = "shared-active-ingredient-v1"
+            current["normalizationVersion"] = "normalization-v1"
+            current["comparisonInputs"] = {
+                "productIds": sorted(product_ids),
+                "sharedActiveIngredientIds": sorted(
+                    str(item.get("entityId"))
+                    for item in shared
+                    if isinstance(item, dict) and item.get("entityId")
+                ),
+            }
             current["medicationIds"] = list(target.get("medicationIds") or [
                 mapping["medicationId"] for mapping in state.get("medicationMappings", [])
                 if mapping.get("selectedProductId") in product_ids
@@ -915,7 +1085,9 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                 item["graphProvenance"] = refreshed_provenance.model_dump(mode="json")
             item["verificationWarnings"] = warnings
             if warnings:
-                provenance_gaps.append(Finding(
+                provenance_gaps.append(make_finding(
+                    rule_id="graph-provenance-review-v1",
+                    comparison_inputs={"provenanceForFindingId": item["findingId"]},
                     findingId=f"provenance-gap-{item['findingId']}",
                     reviewType="EVIDENCE_GAP",
                     summary="Refreshed graph provenance requires pharmacist review.",
@@ -939,7 +1111,9 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
             if warnings:
                 gap_id = f"provenance-gap-{finding_id}"
                 provenance_gaps = [item for item in provenance_gaps if item.get("findingId") != gap_id]
-                provenance_gaps.append(Finding(
+                provenance_gaps.append(make_finding(
+                    rule_id="graph-provenance-review-v1",
+                    comparison_inputs={"provenanceForFindingId": finding_id},
                     findingId=gap_id, reviewType="EVIDENCE_GAP",
                     summary="Refreshed comparison graph provenance requires pharmacist review.",
                     attentionLevel="HIGH", confidence=1.0,
@@ -956,7 +1130,12 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
                     continue
                 gap_id = f"evidence-gap-{gap['sourceTool']}-{target['findingId']}"
                 findings = [item for item in findings if item.get("findingId") != gap_id]
-                findings.append(Finding(
+                findings.append(make_finding(
+                    rule_id="drug-evidence-gap-v1",
+                    comparison_inputs={
+                        "sourceTool": gap["sourceTool"],
+                        "productIds": sorted(gap["productIds"]),
+                    },
                     findingId=gap_id, reviewType="EVIDENCE_GAP", summary=gap["summary"],
                     attentionLevel="HIGH", confidence=1.0,
                     medicationIds=target.get("medicationIds", []),
@@ -972,19 +1151,26 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
         }
 
     async def verify_findings_node(state: ReviewState) -> dict[str, Any]:
+        normalized_findings = [
+            migrate_finding_payload(item)
+            for item in state.get("findings", [])
+        ]
         claims = [{
             "claimId": item["findingId"], "reviewType": item["reviewType"],
+            "ruleId": item["ruleId"],
+            "normalizationVersion": item.get("normalizationVersion"),
+            "comparisonInputs": item.get("comparisonInputs", {}),
             "patientEvidenceRefs": item.get("patientEvidenceRefs", []),
             "labelEvidenceRefs": item.get("labelEvidenceRefs", []),
             "selectedProductIds": item.get("selectedProductIds", []),
-        } for item in state.get("findings", [])]
+        } for item in normalized_findings]
         result, retries, error = await audited_call(state, "verify_findings", "validate_evidence", {"claimCount": len(claims)}, lambda: dependencies.drug.validate_evidence(claims))
         metrics = add_metrics(state, result, retries)
         if error:
             return {"status": ReviewStatus.BLOCKED_TOOL_ERROR.value, "unresolvedItems": [{"kind": "TOOL_ERROR", "error": error}], "metrics": metrics}
         if result is None or result.envelope.status.value not in {"OK", "INSUFFICIENT_EVIDENCE"}:
             return {"status": ReviewStatus.BLOCKED_TOOL_ERROR.value, "unresolvedItems": [{"kind": "VALIDATOR_ERROR", "errors": result.envelope.errors if result else ["missing response"]}], "metrics": metrics}
-        findings = [dict(item) for item in state.get("findings", [])]
+        findings = normalized_findings
         remote = {item.get("claimId"): item for item in result.envelope.data.get("claims", [])} if result else {}
         verified_findings = []
         for item in findings:
@@ -1060,6 +1246,7 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
     graph.add_node("normalize_medications", normalize_medications)
     graph.add_node("resolve_medications", resolve_medications)
     graph.add_node("confirm_mapping", confirm_mapping)
+    graph.add_node("parse_review_goal", parse_review_goal)
     graph.add_node("plan_review", plan_review)
     graph.add_node("retrieve_evidence", retrieve_evidence)
     graph.add_node("build_findings", build_findings)
@@ -1080,12 +1267,37 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
     graph.add_edge("select_patient", "collect_review_context")
     graph.add_edge("validate_context", "normalize_medications")
     graph.add_edge("normalize_medications", "resolve_medications")
-    graph.add_conditional_edges("resolve_medications", lambda state: "end" if state["status"] == ReviewStatus.BLOCKED_TOOL_ERROR.value else "confirm" if state["status"] == ReviewStatus.AWAITING_MAPPING_CONFIRMATION.value else "plan", {"end": END, "confirm": "confirm_mapping", "plan": "plan_review"})
+    graph.add_conditional_edges(
+        "resolve_medications",
+        lambda state: (
+            "end" if state["status"] == ReviewStatus.BLOCKED_TOOL_ERROR.value
+            else "confirm" if state["status"] == ReviewStatus.AWAITING_MAPPING_CONFIRMATION.value
+            else "plan" if state.get("intent")
+            else "parse"
+        ),
+        {
+            "end": END,
+            "confirm": "confirm_mapping",
+            "parse": "parse_review_goal",
+            "plan": "plan_review",
+        },
+    )
     graph.add_conditional_edges(
         "confirm_mapping",
-        lambda state: "confirm" if state["status"] == ReviewStatus.AWAITING_MAPPING_CONFIRMATION.value else "reinvestigate" if state.get("reinvestigateFindingIds") else "plan",
-        {"confirm": "confirm_mapping", "reinvestigate": "reinvestigate_evidence", "plan": "plan_review"},
+        lambda state: (
+            "confirm" if state["status"] == ReviewStatus.AWAITING_MAPPING_CONFIRMATION.value
+            else "reinvestigate" if state.get("reinvestigateFindingIds")
+            else "bind" if state.get("intent")
+            else "parse"
+        ),
+        {
+            "confirm": "confirm_mapping",
+            "reinvestigate": "reinvestigate_evidence",
+            "bind": "plan_review",
+            "parse": "parse_review_goal",
+        },
     )
+    graph.add_edge("parse_review_goal", "plan_review")
     graph.add_edge("plan_review", "retrieve_evidence")
     graph.add_conditional_edges("retrieve_evidence", lambda state: "end" if state.get("status") == ReviewStatus.BLOCKED_TOOL_ERROR.value else "build", {"end": END, "build": "build_findings"})
     graph.add_edge("build_findings", "verify_findings")
@@ -1142,5 +1354,9 @@ def state_to_snapshot(existing: ReviewSnapshot, state: dict[str, Any]) -> Review
     fields = ReviewSnapshot.model_fields
     merged = existing.model_dump(mode="python")
     merged.update({key: value for key, value in state.items() if key in fields})
+    merged["findings"] = [
+        migrate_finding_payload(item)
+        for item in merged.get("findings") or []
+    ]
     merged["updatedAt"] = datetime.now(UTC)
     return ReviewSnapshot.model_validate(merged)

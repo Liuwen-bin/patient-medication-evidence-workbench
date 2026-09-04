@@ -66,6 +66,32 @@ def test_repository_rejects_unknown_review_schema(tmp_path: Path) -> None:
         repository.get(snapshot.reviewId)
 
 
+def test_repository_backfills_provenance_for_early_1_1_findings(tmp_path: Path) -> None:
+    repository = ReviewRepository(tmp_path / "reviews.sqlite")
+    snapshot = repository.create(patient_ref="p1", question="核查标签")
+    payload = snapshot.model_dump(mode="json")
+    payload["findings"] = [{
+        "findingId": "legacy-finding",
+        "reviewType": "LABEL_WARNING",
+        "summary": "Review label warning.",
+        "attentionLevel": "HIGH",
+        "confidence": 0.8,
+        "patientEvidenceRefs": ["FHIR:MedicationRequest/m1"],
+        "labelEvidenceRefs": ["SPL:doc-1#warnings"],
+    }]
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE reviews SET snapshot_json = ? WHERE review_id = ?",
+            (json.dumps(payload), snapshot.reviewId),
+        )
+
+    restored = repository.get(snapshot.reviewId)
+
+    assert restored.findings[0].ruleId == "legacy-label-warning-v1"
+    assert restored.findings[0].normalizationVersion is None
+    assert restored.findings[0].comparisonInputs == {}
+
+
 def test_stale_review_update_is_rejected(tmp_path: Path) -> None:
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
     created = repository.create(patient_ref="FHIR:Patient/p1", question="默认用药证据核查")
@@ -115,6 +141,38 @@ def test_audit_event_does_not_store_raw_patient_payload(tmp_path: Path) -> None:
     serialized = json.dumps(repository.list_audit(review.reviewId))
     assert "patientName" not in serialized
     assert "FHIR:MedicationRequest/m1" in serialized
+
+
+def test_model_audit_persists_fallback_without_prompt_or_patient_features(
+    tmp_path: Path,
+) -> None:
+    repository = ReviewRepository(tmp_path / "reviews.sqlite")
+    review = repository.create(
+        patient_ref="FHIR:Patient/p1",
+        question="核查储存条件",
+    )
+
+    event = repository.append_audit(
+        review.reviewId,
+        node="parse_review_goal",
+        tool=None,
+        request_id=None,
+        result_status="MODEL_FALLBACK",
+        argument_summary={"topicCount": 1, "medicationCount": 2},
+        evidence_refs=[],
+        latency_ms=12,
+        model_id="test-model",
+        prompt_version="intent-v1",
+        input_tokens=17,
+        output_tokens=5,
+        estimated_cost=0.0,
+        model_fallback=True,
+    )
+
+    assert event.modelFallback is True
+    serialized = event.model_dump_json()
+    assert "核查储存条件" not in serialized
+    assert "patientFeatures" not in serialized
 
 
 @pytest.mark.parametrize("unsafe_key", ["name", "birthDate", "content", "attachment", "dosage", "rawPayload"])

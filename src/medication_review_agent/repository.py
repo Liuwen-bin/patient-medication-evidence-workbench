@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
-from .models import AuditEvent, ReviewSnapshot, ReviewStatus
+from .models import AuditEvent, ReviewSnapshot, ReviewStatus, migrate_finding_payload
 
 
 class ReviewVersionConflict(RuntimeError):
@@ -31,22 +31,25 @@ class UnsupportedReviewSchema(ValueError):
 
 def migrate_review_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     version = str(payload.get("schemaVersion") or "1.0")
-    if version == "1.1":
-        return payload
-    if version != "1.0":
+    if version not in {"1.0", "1.1"}:
         raise UnsupportedReviewSchema(f"Unsupported review schema: {version}")
     migrated = dict(payload)
-    migrated.update({
-        "schemaVersion": "1.1",
-        "question": migrated.get("question") or "默认用药证据核查",
-        "intent": migrated.get("intent"),
-        "writebackStatus": migrated.get("writebackStatus") or "NOT_REQUESTED",
-        "writebackJob": migrated.get("writebackJob"),
-        "writebackError": migrated.get("writebackError"),
-        "modelCalls": migrated.get("modelCalls") or [],
-        "retrievalAttempts": migrated.get("retrievalAttempts") or {},
-        "reinvestigationCounts": migrated.get("reinvestigationCounts") or {},
-    })
+    if version == "1.0":
+        migrated.update({
+            "schemaVersion": "1.1",
+            "question": migrated.get("question") or "默认用药证据核查",
+            "intent": migrated.get("intent"),
+            "writebackStatus": migrated.get("writebackStatus") or "NOT_REQUESTED",
+            "writebackJob": migrated.get("writebackJob"),
+            "writebackError": migrated.get("writebackError"),
+            "modelCalls": migrated.get("modelCalls") or [],
+            "retrievalAttempts": migrated.get("retrievalAttempts") or {},
+            "reinvestigationCounts": migrated.get("reinvestigationCounts") or {},
+        })
+    migrated["findings"] = [
+        migrate_finding_payload(item)
+        for item in migrated.get("findings") or []
+    ]
     return migrated
 
 
@@ -191,6 +194,7 @@ class ReviewRepository:
         retry_count: int = 0, model_id: str | None = None,
         prompt_version: str | None = None, input_tokens: int = 0,
         output_tokens: int = 0, estimated_cost: float = 0.0,
+        model_fallback: bool = False,
         mutation_id: str | None = None, audit_slot: str | None = None,
     ) -> AuditEvent:
         _validate_argument_summary(argument_summary)
@@ -203,6 +207,7 @@ class ReviewRepository:
             latencyMs=latency_ms, retryCount=retry_count, modelId=model_id,
             promptVersion=prompt_version, inputTokens=input_tokens,
             outputTokens=output_tokens, estimatedCost=estimated_cost,
+            modelFallback=model_fallback,
         )
         event_key = hashlib.sha256((audit_slot or "").encode("utf-8")).hexdigest()
         try:

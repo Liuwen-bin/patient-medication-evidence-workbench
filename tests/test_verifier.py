@@ -7,6 +7,7 @@ from medication_review_agent.verifier import apply_verification, verify_local_po
 def pending_finding(**updates) -> Finding:
     values = {
         "findingId": "f1", "reviewType": "LABEL_WARNING",
+        "ruleId": "label-warning-v1",
         "summary": "Review label warning.", "attentionLevel": "HIGH",
         "confidence": 0.8, "patientEvidenceRefs": ["FHIR:MedicationRequest/m1"],
         "labelEvidenceRefs": ["SPL:doc-1#section-1"],
@@ -62,4 +63,3 @@ def test_remote_validation_errors_are_machine_readable() -> None:
     verified = apply_verification(pending_finding(), remote_errors=["out_of_scope_label_evidence"])
     assert verified.status == FindingStatus.NEEDS_MORE_EVIDENCE
     assert verified.verificationErrors == ["out_of_scope_label_evidence"]
-

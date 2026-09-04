@@ -34,6 +34,7 @@ def test_accepted_finding_requires_paired_evidence() -> None:
         Finding(
             findingId="f1",
             reviewType="LABEL_WARNING",
+            ruleId="label-warning-v1",
             summary="Candidate warning",
             attentionLevel="HIGH",
             confidence=0.9,
@@ -47,6 +48,7 @@ def test_evidence_gap_can_be_accepted_without_paired_evidence() -> None:
     finding = Finding(
         findingId="f1",
         reviewType="EVIDENCE_GAP",
+        ruleId="evidence-gap-v1",
         summary="No mapped DailyMed product",
         attentionLevel="HIGH",
         confidence=1.0,

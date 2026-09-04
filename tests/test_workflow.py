@@ -4,8 +4,17 @@ import pytest
 from langgraph.types import Command
 
 from medication_review_agent.gateways import ToolContractError
-from medication_review_agent.models import ReviewSnapshot, ReviewStatus
-from medication_review_agent.workflow import state_to_snapshot
+from medication_review_agent.models import (
+    ModelCallRecord,
+    ReviewIntent,
+    ReviewPlanItem,
+    ReviewSnapshot,
+    ReviewStatus,
+    ReviewTopic,
+)
+from medication_review_agent.planner import PlanningResult
+from medication_review_agent.repository import ReviewRepository
+from medication_review_agent.workflow import deidentified_patient_features, state_to_snapshot
 
 from tests.fakes import (
     FakeDrugGateway,
@@ -20,6 +29,81 @@ from tests.fakes import (
 
 MED1 = {"id": "med-1", "medication": "ARNICA", "identifiers": [{"system": "ndc", "code": "1"}], "strength": None, "dosage": None, "route": None, "evidenceRef": "FHIR:MedicationRequest/med-1"}
 MED2 = {"id": "med-2", "medication": "METFORMIN", "identifiers": [], "strength": None, "dosage": None, "route": None, "evidenceRef": "FHIR:MedicationRequest/med-2"}
+
+
+class RecordingPlanner:
+    def __init__(self, result: PlanningResult) -> None:
+        self.result = result
+        self.calls = 0
+        self.question = None
+        self.patient_features = None
+        self.mappings = None
+        self.missing_fields = None
+
+    async def plan(self, question, patient_features, mappings, missing_fields):
+        self.calls += 1
+        self.question = question
+        self.patient_features = patient_features
+        self.mappings = mappings
+        self.missing_fields = missing_fields
+        return self.result
+
+
+def planning_result(*topics: ReviewTopic, with_model_call: bool = True) -> PlanningResult:
+    selected_topics = list(topics or (ReviewTopic.STORAGE,))
+    intent = ReviewIntent(
+        topics=selected_topics,
+        requiresNarrativeEvidence=True,
+        rationale="核查目标主题",
+        confidence=0.91,
+        modelId="test-model" if with_model_call else None,
+        promptVersion="intent-v1" if with_model_call else "deterministic-v1",
+    )
+    return PlanningResult(
+        intent=intent,
+        items=[ReviewPlanItem(
+            planItemId=f"topic-{selected_topics[0].value}",
+            reviewType=selected_topics[0].value.upper(),
+            topics=[selected_topics[0].value],
+            rationale=intent.rationale,
+        )],
+        modelCall=ModelCallRecord(
+            modelId="test-model",
+            promptVersion="intent-v1",
+            inputTokens=17,
+            outputTokens=5,
+            estimatedCost=0.0,
+            latencyMs=12,
+        ) if with_model_call else None,
+    )
+
+
+def test_workflow_reexports_all_interrupt_contracts() -> None:
+    from medication_review_agent.workflow import FindingDecision as compatibility_type
+    from medication_review_agent.workflow_state import FindingDecision as extracted_type
+
+    assert compatibility_type is extracted_type
+
+
+def test_deidentified_features_drop_nested_identity_values() -> None:
+    features = deidentified_patient_features({
+        "patient": {"id": "patient-secret", "name": "person-secret", "age": 42},
+        "allergies": [
+            {"substance": "aspirin", "patientName": "person-secret"},
+            {"substance": {"display": "penicillin", "patientId": "patient-secret"}},
+        ],
+        "specialPopulations": [
+            "pregnant",
+            {"flag": "older_adult", "patientId": "patient-secret"},
+        ],
+    })
+
+    assert features == {
+        "ageBand": "adult",
+        "allergyTerms": ["aspirin"],
+        "specialPopulationFlags": ["pregnant"],
+    }
+    assert "secret" not in str(features)
 
 
 @pytest.mark.parametrize(("review_id", "question"), [
@@ -127,6 +211,82 @@ async def test_stop_use_evidence_question_reaches_health_tools(tmp_path: Path) -
 
     assert state["questionSafety"]["code"] == "ALLOWED_EVIDENCE_REVIEW"
     assert health.calls == [("P001", None)]
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_question_is_parsed_with_deidentified_context_and_metadata_survives_checkpoint(
+    tmp_path: Path,
+) -> None:
+    planner = RecordingPlanner(planning_result(ReviewTopic.STORAGE))
+    graph = build_test_graph(
+        tmp_path,
+        FakeHealthGateway(health_context(MED1)),
+        FakeDrugGateway(standard_drug_responses({"ARNICA": mapped_response()})),
+        review_id="review-plan",
+        question="核查储存条件",
+        planner=planner,
+    )
+    config = {"configurable": {"thread_id": "review-plan"}}
+
+    state = await graph.ainvoke(
+        {"reviewId": "review-plan", "question": "核查储存条件", "patientRef": "P001"},
+        config=config,
+    )
+    checkpoint = await graph.aget_state(config)
+
+    assert planner.calls == 1
+    assert planner.question == "核查储存条件"
+    assert planner.patient_features == {
+        "ageBand": "adult",
+        "allergyTerms": [],
+        "specialPopulationFlags": [],
+    }
+    assert planner.mappings[0].selectedProductId == "DRUG_PRODUCT::1"
+    assert state["intent"]["topics"] == ["storage"]
+    assert state["modelCalls"][0]["promptVersion"] == "intent-v1"
+    assert checkpoint.values["intent"] == state["intent"]
+    assert checkpoint.values["modelCalls"] == state["modelCalls"]
+    assert state["reviewPlan"][0]["medicationIds"] == ["med-1"]
+
+    repository = ReviewRepository(tmp_path / "reviews.sqlite")
+    projected = state_to_snapshot(repository.get("review-plan"), checkpoint.values)
+    assert projected.intent is not None
+    assert projected.intent.topics == [ReviewTopic.STORAGE]
+    assert projected.modelCalls[0].modelId == "test-model"
+    model_audit = next(
+        item for item in repository.list_audit("review-plan")
+        if item["node"] == "parse_review_goal"
+    )
+    assert model_audit["argumentSummary"] == {"topicCount": 1, "medicationCount": 1}
+    assert model_audit["modelId"] == "test-model"
+    assert model_audit["promptVersion"] == "intent-v1"
+    assert model_audit["modelFallback"] is False
+    assert "核查储存条件" not in str(model_audit)
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_plan_adds_only_topic_relevant_missing_field_findings(tmp_path: Path) -> None:
+    planner = RecordingPlanner(planning_result(ReviewTopic.STORAGE, with_model_call=False))
+    graph = build_test_graph(
+        tmp_path,
+        FakeHealthGateway(health_context(
+            MED1,
+            missing=["allergies", "activeMedications.med-1.route"],
+        )),
+        FakeDrugGateway(standard_drug_responses({"ARNICA": mapped_response()})),
+        review_id="review-storage",
+        question="核查储存条件",
+        planner=planner,
+    )
+
+    state = await graph.ainvoke(
+        {"reviewId": "review-storage", "question": "核查储存条件", "patientRef": "P001"},
+        config={"configurable": {"thread_id": "review-storage"}},
+    )
+
+    assert not [item for item in state["findings"] if item.get("missingField")]
     await graph.checkpointer.conn.close()
 
 
@@ -332,6 +492,69 @@ async def test_neo4j_set_comparison_builds_duplicate_ingredient_finding(tmp_path
     duplicates = [item for item in result["findings"] if item["reviewType"] == "DUPLICATE_ACTIVE_INGREDIENT"]
     assert duplicates[0]["graphProvenance"]["graphBackend"] == "neo4j"
     assert duplicates[0]["labelEvidenceRefs"] == ["SPL:doc-1#document"]
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_computed_claim_carries_rule_inputs_and_both_reference_sets(
+    tmp_path: Path,
+) -> None:
+    second_mapping = envelope("OK", {
+        "matchClass": "EXACT_IDENTIFIER",
+        "autoAcceptable": True,
+        "selectedProductId": "DRUG_PRODUCT::2",
+        "candidates": [],
+        "unmatchedFields": [],
+    }, provenance={
+        "graphBackend": "neo4j",
+        "graphWorkspace": "dailymed",
+        "graphDatabase": "neo4j",
+        "fallbackUsed": False,
+        "consistency": {"status": "CONSISTENT"},
+    })
+    responses = standard_drug_responses({
+        "ARNICA": mapped_response(),
+        "METFORMIN": second_mapping,
+    })
+    responses["compare"] = envelope("OK", {
+        "products": ["DRUG_PRODUCT::1", "DRUG_PRODUCT::2"],
+        "sharedActiveIngredients": [
+            {"entityId": "INGREDIENT::ARNICA", "name": "Arnica"},
+        ],
+    }, refs=["SPL:doc-1#document"], provenance={
+        "graphBackend": "neo4j",
+        "graphWorkspace": "dailymed",
+        "graphDatabase": "neo4j",
+        "fallbackUsed": False,
+        "consistency": {"status": "CONSISTENT"},
+    })
+    drug = FakeDrugGateway(responses)
+    graph = build_test_graph(
+        tmp_path,
+        FakeHealthGateway(health_context(MED1, MED2)),
+        drug,
+    )
+
+    await graph.ainvoke(
+        {"reviewId": "review-1", "patientRef": "P001", "asOf": "2026-08-31"},
+        config={"configurable": {"thread_id": "review-1"}},
+    )
+
+    claims = next(payload for name, payload in drug.calls if name == "validate_evidence")
+    computed = next(
+        item for item in claims if item["reviewType"] == "DUPLICATE_ACTIVE_INGREDIENT"
+    )
+    assert computed["ruleId"] == "shared-active-ingredient-v1"
+    assert computed["normalizationVersion"] == "normalization-v1"
+    assert computed["comparisonInputs"] == {
+        "productIds": ["DRUG_PRODUCT::1", "DRUG_PRODUCT::2"],
+        "sharedActiveIngredientIds": ["INGREDIENT::ARNICA"],
+    }
+    assert computed["patientEvidenceRefs"] == [
+        "FHIR:MedicationRequest/med-1",
+        "FHIR:MedicationRequest/med-2",
+    ]
+    assert computed["labelEvidenceRefs"] == ["SPL:doc-1#document"]
     await graph.checkpointer.conn.close()
 
 
@@ -821,7 +1044,15 @@ async def test_context_refresh_reresolves_changed_medication_and_replaces_depend
         }),
     })
     drug = FakeDrugGateway(responses)
-    graph = build_test_graph(tmp_path, SequencedHealthGateway(), drug)
+    planner = RecordingPlanner(
+        planning_result(ReviewTopic.WARNINGS, with_model_call=False)
+    )
+    graph = build_test_graph(
+        tmp_path,
+        SequencedHealthGateway(),
+        drug,
+        planner=planner,
+    )
     config = {"configurable": {"thread_id": "review-1"}}
     first = await graph.ainvoke({"reviewId": "review-1", "patientRef": "P001", "asOf": "2026-08-31"}, config=config)
     gap = next(item for item in first["findings"] if item.get("missingField") == "allergies")
@@ -831,6 +1062,71 @@ async def test_context_refresh_reresolves_changed_medication_and_replaces_depend
     assert mapping["sourceName"] == "METFORMIN"
     assert mapping["selectedProductId"] == "DRUG_PRODUCT::2"
     assert all("DRUG_PRODUCT::1" not in item.get("productIds", []) for item in updated["evidenceIndex"])
+    assert planner.calls == 1
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_changed_medication_confirmation_reuses_existing_intent(tmp_path: Path) -> None:
+    changed = {
+        **MED1,
+        "medication": "METFORMIN",
+        "identifiers": [{"system": "ndc", "code": "2"}],
+    }
+
+    class SequencedHealthGateway:
+        def __init__(self) -> None:
+            self.responses = [
+                health_context(MED1, missing=["allergies"]),
+                health_context(changed),
+            ]
+
+        async def get_review_context(self, patient_id: str | None, as_of: str | None):
+            return self.responses.pop(0)
+
+    ambiguous = envelope("AMBIGUOUS", {
+        "matchClass": "AMBIGUOUS_NAME",
+        "selectedProductId": None,
+        "candidates": [{"productId": "DRUG_PRODUCT::2"}],
+        "unmatchedFields": [],
+    })
+    planner = RecordingPlanner(
+        planning_result(ReviewTopic.WARNINGS, with_model_call=False)
+    )
+    graph = build_test_graph(
+        tmp_path,
+        SequencedHealthGateway(),
+        FakeDrugGateway(standard_drug_responses({
+            "ARNICA": mapped_response(),
+            "METFORMIN": ambiguous,
+        })),
+        planner=planner,
+    )
+    config = {"configurable": {"thread_id": "review-1"}}
+    first = await graph.ainvoke(
+        {"reviewId": "review-1", "patientRef": "P001", "asOf": "2026-08-31"},
+        config=config,
+    )
+    gap = next(item for item in first["findings"] if item.get("missingField") == "allergies")
+    awaiting_mapping = await graph.ainvoke(Command(resume={
+        "action": "COMPLETE_FINDING_REVIEW",
+        "reviewerId": "pharmacist-demo",
+        "decisions": [{
+            "action": "REQUEST_MORE_EVIDENCE",
+            "findingId": gap["findingId"],
+        }],
+    }), config=config)
+    assert awaiting_mapping["status"] == "AWAITING_MAPPING_CONFIRMATION"
+
+    resumed = await graph.ainvoke(Command(resume={
+        "action": "CONFIRM_MAPPING",
+        "medicationId": "med-1",
+        "productId": "DRUG_PRODUCT::2",
+        "reviewerId": "pharmacist-demo",
+    }), config=config)
+
+    assert resumed["intent"] == first["intent"]
+    assert planner.calls == 1
     await graph.checkpointer.conn.close()
 
 

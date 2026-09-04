@@ -20,7 +20,8 @@ def signed_review_snapshot() -> ReviewSnapshot:
         medications=[MedicationRecord(medicationId="m1", name="METFORMIN <script>", patientEvidenceRefs=["FHIR:MedicationRequest/m1"])],
         medicationMappings=[MedicationMapping(medicationId="m1", sourceName="METFORMIN <script>", matchClass="UNMAPPED")],
         findings=[Finding(
-            findingId="f1", reviewType="EVIDENCE_GAP", summary="No mapped product",
+            findingId="f1", reviewType="EVIDENCE_GAP", ruleId="unmapped-medication-v1",
+            summary="No mapped product",
             attentionLevel="HIGH", confidence=1.0, status=FindingStatus.ACCEPTED,
         )],
         evidenceIndex=[EvidenceItem(
