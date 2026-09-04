@@ -1,5 +1,24 @@
-import { createReview, getAudit, getReview, runReview, sendDecision } from "./api-client.js";
-import { renderAuditTimeline, renderEvidence, renderPatientContext, renderReviewQueue, renderSignOffDialog, renderStatus } from "./render.js";
+import {
+  commitWriteback,
+  completeReview,
+  createReview,
+  getAudit,
+  getReview,
+  prepareWriteback,
+  runReview,
+  sendDecision,
+} from "./api-client.js";
+import {
+  renderAuditTimeline,
+  renderEvidence,
+  renderPatientContext,
+  renderReviewQueue,
+  renderSignOffDialog,
+  renderStatus,
+  renderWritebackDialog,
+  renderWritebackPreview,
+  renderWritebackResult,
+} from "./render.js";
 
 const state = {
   review: null,
@@ -15,16 +34,22 @@ const nodes = {
   patientId: document.querySelector("#patient-id"),
   asOf: document.querySelector("#as-of"),
   question: document.querySelector("#review-question"),
-  run: document.querySelector("#run-review"),
-  sign: document.querySelector("#sign-report"),
+  run: document.querySelector("#start-review"),
+  sign: document.querySelector("#complete-review"),
+  prepare: document.querySelector("#prepare-writeback"),
+  commit: document.querySelector("#open-writeback-confirmation"),
+  exports: document.querySelector("#report-exports"),
   status: document.querySelector("#review-status"),
   patient: document.querySelector("#patient-panel"),
   queue: document.querySelector("#review-queue"),
   evidence: document.querySelector("#evidence-panel"),
+  evidenceDetail: document.querySelector("#evidence-detail"),
+  writebackPreview: document.querySelector("#writeback-preview"),
+  writebackResult: document.querySelector("#writeback-result"),
   live: document.querySelector("#live-region"),
   dialogRoot: document.querySelector("#dialog-root"),
 };
-let signOffOpener = null;
+let dialogOpener = null;
 
 const awaitingHuman = new Set([
   "AWAITING_PATIENT_CONFIRMATION",
@@ -88,10 +113,10 @@ async function decide(action, details = {}) {
   }
 }
 
-function closeSignOffDialog() {
+function closeDialog() {
   nodes.dialogRoot.replaceChildren();
-  signOffOpener?.focus();
-  signOffOpener = null;
+  dialogOpener?.focus();
+  dialogOpener = null;
 }
 
 async function signOff(reviewer) {
@@ -99,18 +124,17 @@ async function signOff(reviewer) {
   state.pending = true;
   render();
   try {
-    state.review = await sendDecision(state.review.reviewId, {
+    state.review = await completeReview(state.review.reviewId, {
       expectedVersion: state.review.version,
-      action: "SIGN_OFF",
       reviewerId: reviewer,
     });
-    closeSignOffDialog();
-    notice("报告已签署");
+    closeDialog();
+    notice("审核已完成");
   } catch (error) {
     if (error.status === 409) {
-      closeSignOffDialog();
+      closeDialog();
       state.review = await getReview(state.review.reviewId);
-      notice("审核状态已被更新，请重新确认当前项目", "error");
+      notice("状态已更新，请重新确认", "error");
     } else {
       notice(`操作失败：${error.message}`, "error");
     }
@@ -122,8 +146,8 @@ async function signOff(reviewer) {
 
 function openSignOffDialog() {
   if (!state.review || state.review.status !== "READY_FOR_SIGN_OFF" || state.pending) return;
-  const dialog = renderSignOffDialog(state.review, signOff, closeSignOffDialog);
-  signOffOpener = nodes.sign;
+  const dialog = renderSignOffDialog(state.review, signOff, closeDialog);
+  dialogOpener = nodes.sign;
   nodes.dialogRoot.replaceChildren(dialog);
   const reviewerInput = dialog.querySelector("#sign-off-reviewer-id");
   reviewerInput?.focus();
@@ -143,6 +167,75 @@ function openSignOffDialog() {
   });
 }
 
+async function prepareCurrentWriteback() {
+  if (!state.review || state.pending || !reviewerId()) return;
+  state.pending = true;
+  render();
+  try {
+    state.review = await prepareWriteback(state.review.reviewId, {
+      expectedVersion: state.review.version,
+      reviewerId: reviewerId(),
+    });
+    notice("FHIR 写回预览已生成");
+    if (window.matchMedia("(max-width: 899px)").matches) setActiveTab("evidence");
+  } catch (error) {
+    if (error.status === 409) {
+      state.review = await getReview(state.review.reviewId);
+      notice("状态已更新，请重新确认", "error");
+    } else {
+      notice(`生成预览失败：${error.message}`, "error");
+    }
+  } finally {
+    state.pending = false;
+    render();
+  }
+}
+
+async function commitCurrentWriteback() {
+  if (!state.review?.writebackJob || state.pending) return;
+  state.pending = true;
+  render();
+  try {
+    state.review = await commitWriteback(state.review.reviewId, {
+      expectedVersion: state.review.version,
+      reviewerId: reviewerId(),
+      bundleHash: state.review.writebackJob.bundleHash,
+      confirmed: true,
+    });
+    closeDialog();
+    notice("FHIR 写回完成");
+  } catch (error) {
+    closeDialog();
+    if (error.status === 409) {
+      state.review = await getReview(state.review.reviewId);
+      notice("状态已更新，请重新确认", "error");
+    } else {
+      try {
+        state.review = await getReview(state.review.reviewId);
+      } catch {
+        // Keep the last durable snapshot when refresh is unavailable.
+      }
+      notice(`写回失败：${error.message}`, "error");
+    }
+  } finally {
+    state.pending = false;
+    render();
+  }
+}
+
+function openWritebackDialog() {
+  if (!state.review?.writebackJob || state.pending || !reviewerId()) return;
+  const dialog = renderWritebackDialog(
+    state.review,
+    reviewerId(),
+    commitCurrentWriteback,
+    closeDialog,
+  );
+  dialogOpener = nodes.commit;
+  nodes.dialogRoot.replaceChildren(dialog);
+  dialog.querySelector("#writeback-confirmed")?.focus();
+}
+
 function render() {
   renderStatus(state.review, nodes.status);
   renderPatientContext(state.review, nodes.patient);
@@ -150,9 +243,16 @@ function render() {
   renderReviewQueue(state.review, nodes.queue, state.selectedFindingId, (findingId) => {
     state.selectedFindingId = findingId;
     render();
-    if (window.matchMedia("(max-width: 920px)").matches) setActiveTab("evidence");
+    if (window.matchMedia("(max-width: 899px)").matches) {
+      setActiveTab("evidence");
+      const evidenceHeading = nodes.evidenceDetail.querySelector("h2");
+      evidenceHeading?.setAttribute("tabindex", "-1");
+      evidenceHeading?.focus();
+    }
   }, decide);
-  renderEvidence(state.review, nodes.evidence, state.selectedFindingId);
+  renderEvidence(state.review, nodes.evidenceDetail, state.selectedFindingId);
+  renderWritebackPreview(nodes.writebackPreview, state.review);
+  renderWritebackResult(nodes.writebackResult, state.review);
   if (state.notice) {
     const node = document.createElement("p");
     node.id = "workbench-notice";
@@ -163,17 +263,27 @@ function render() {
   }
   nodes.run.disabled = state.pending;
   nodes.sign.disabled = state.pending || state.review?.status !== "READY_FOR_SIGN_OFF";
-  let reportLink = document.querySelector("#signed-report-link");
+  nodes.sign.textContent = state.review?.status === "SIGNED_OFF" ? "审核已完成" : "完成审核";
+  const canPrepare = state.review?.status === "SIGNED_OFF" && (
+    state.review.writebackStatus === "NOT_REQUESTED"
+    || (state.review.writebackStatus === "FAILED" && !state.review.writebackJob)
+  );
+  nodes.prepare.disabled = state.pending || !canPrepare;
+  nodes.prepare.textContent = state.review?.writebackStatus === "FAILED" ? "重新生成预览" : "生成写回预览";
+  const canCommit = state.review?.status === "SIGNED_OFF"
+    && Boolean(state.review.writebackJob)
+    && (state.review.writebackStatus === "PREPARED"
+      || (state.review.writebackStatus === "FAILED" && state.review.writebackError?.retryable));
+  nodes.commit.disabled = state.pending || !canCommit;
+  nodes.commit.textContent = state.review?.writebackStatus === "FAILED" ? "重试写回" : "确认写回";
+  nodes.exports.replaceChildren();
   if (state.review?.status === "SIGNED_OFF") {
-    if (!reportLink) {
-      reportLink = document.createElement("a");
-      reportLink.id = "signed-report-link";
-      reportLink.textContent = "查看报告";
-      nodes.sign.insertAdjacentElement("afterend", reportLink);
-    }
-    reportLink.href = `/api/reviews/${encodeURIComponent(state.review.reviewId)}/report.html`;
-  } else {
-    reportLink?.remove();
+    [["导出 JSON", "report.json"], ["导出 HTML", "report.html"]].forEach(([label, file]) => {
+      const link = document.createElement("a");
+      link.textContent = label;
+      link.href = `/api/reviews/${encodeURIComponent(state.review.reviewId)}/${file}`;
+      nodes.exports.append(link);
+    });
   }
 }
 
@@ -192,7 +302,7 @@ async function loadReview(reviewId) {
     nodes.asOf.value = state.review.asOf || "";
     nodes.question.value = state.review.question || nodes.question.value;
     state.selectedFindingId = state.review.findings?.[0]?.findingId || null;
-    if (awaitingHuman.has(state.review.status) && window.matchMedia("(max-width: 920px)").matches) {
+    if (awaitingHuman.has(state.review.status) && window.matchMedia("(max-width: 899px)").matches) {
       setActiveTab("queue");
     }
     announce("复核状态已载入");
@@ -221,7 +331,7 @@ nodes.run.addEventListener("click", async () => {
     state.selectedFindingId = state.review.findings?.[0]?.findingId || null;
     history.replaceState(null, "", `?review=${encodeURIComponent(state.review.reviewId)}`);
     announce("复核已运行，请核对当前审核项");
-    if (awaitingHuman.has(state.review.status) && window.matchMedia("(max-width: 920px)").matches) setActiveTab("queue");
+    if (awaitingHuman.has(state.review.status) && window.matchMedia("(max-width: 899px)").matches) setActiveTab("queue");
   } catch (error) {
     announce(`运行失败：${error.message}`);
   } finally {
@@ -235,8 +345,10 @@ document.querySelectorAll("[data-tab]").forEach((button) => {
 });
 
 nodes.sign.addEventListener("click", openSignOffDialog);
+nodes.prepare.addEventListener("click", prepareCurrentWriteback);
+nodes.commit.addEventListener("click", openWritebackDialog);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && nodes.dialogRoot.firstElementChild) closeSignOffDialog();
+  if (event.key === "Escape" && nodes.dialogRoot.firstElementChild) closeDialog();
 });
 
 if (!nodes.asOf.value) nodes.asOf.value = new Date().toISOString().slice(0, 10);

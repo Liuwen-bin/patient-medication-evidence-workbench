@@ -13,8 +13,9 @@ def _review(*, status: str = "AWAITING_MAPPING_CONFIRMATION") -> dict:
     }
     return {
         "reviewId": "review-ui",
-        "schemaVersion": "1.0",
+        "schemaVersion": "1.1",
         "status": status,
+        "question": "核查活动用药医嘱的成分、途径、剂型和标签警告",
         "patientRef": "FHIR:Patient/p1",
         "asOf": "2026-08-31",
         "contextSnapshot": {
@@ -55,6 +56,9 @@ def _review(*, status: str = "AWAITING_MAPPING_CONFIRMATION") -> dict:
             "graphProvenance": graph,
         }],
         "unresolvedItems": [], "humanDecisions": [], "auditEvents": [],
+        "writebackStatus": "NOT_REQUESTED",
+        "writebackJob": None,
+        "writebackError": None,
         "metrics": {"toolLatencyMs": 12, "retries": 0, "inputTokens": 0, "outputTokens": 0, "estimatedCost": 0},
         "version": 3,
         "createdAt": "2026-08-31T08:00:00Z", "updatedAt": "2026-08-31T08:01:00Z",
@@ -70,6 +74,9 @@ def _mock_review(page: Page, snapshot: dict, on_post=None, audit=None) -> None:
 
     page.route("**/api/reviews/review-ui", handle)
     page.route("**/api/reviews/review-ui/decisions", handle)
+    page.route("**/api/reviews/review-ui/complete", handle)
+    page.route("**/api/reviews/review-ui/writeback/prepare", handle)
+    page.route("**/api/reviews/review-ui/writeback/commit", handle)
     page.route("**/api/reviews/review-ui/audit", lambda route: route.fulfill(
         status=200, content_type="application/json", body=json.dumps(audit or [])
     ))
@@ -252,7 +259,7 @@ def test_stale_finding_decision_refreshes_without_retry(
     assert post_count == 1
 
 
-def test_report_requires_explicit_final_confirmation(
+def test_completion_requires_explicit_final_confirmation(
     page: Page, live_server_url: str
 ) -> None:
     snapshot = _review(status="READY_FOR_SIGN_OFF")
@@ -260,9 +267,7 @@ def test_report_requires_explicit_final_confirmation(
 
     def sign(route: Route) -> None:
         payload = route.request.post_data_json
-        assert payload == {
-            "expectedVersion": 3, "action": "SIGN_OFF", "reviewerId": "pharmacist-demo",
-        }
+        assert payload == {"expectedVersion": 3, "reviewerId": "pharmacist-demo"}
         route.fulfill(
             status=200,
             content_type="application/json",
@@ -271,20 +276,20 @@ def test_report_requires_explicit_final_confirmation(
 
     _mock_review(page, snapshot, sign)
     page.goto(f"{live_server_url}/?review=review-ui")
-    page.get_by_role("button", name="提交报告").click()
+    page.get_by_role("button", name="完成审核").click()
 
-    dialog = page.get_by_role("dialog", name="确认提交审核报告")
+    dialog = page.get_by_role("dialog", name="确认完成审核")
     expect(dialog).to_be_visible()
     expect(dialog).to_contain_text("接受 1")
     expect(dialog).to_contain_text("排除 0")
     expect(dialog).to_contain_text("未映射 0")
     expect(dialog).to_contain_text("证据缺口 0")
-    expect(page.get_by_role("button", name="确认签署")).to_be_disabled()
+    expect(page.get_by_role("button", name="确认完成")).to_be_disabled()
     page.get_by_label("我已核对全部审核项").check()
-    page.get_by_role("button", name="确认签署").click()
+    page.get_by_role("button", name="确认完成").click()
 
-    expect(page.locator("#review-status")).to_contain_text("已签署")
-    expect(page.get_by_role("link", name="查看报告")).to_have_attribute(
+    expect(page.locator("#review-status")).to_contain_text("审核已完成")
+    expect(page.get_by_role("link", name="导出 HTML")).to_have_attribute(
         "href", "/api/reviews/review-ui/report.html"
     )
 
@@ -318,11 +323,11 @@ def test_sign_off_escape_closes_dialog_without_mutation(
 
     _mock_review(page, snapshot, unexpected_post)
     page.goto(f"{live_server_url}/?review=review-ui")
-    page.get_by_role("button", name="提交报告").click()
-    expect(page.get_by_role("dialog", name="确认提交审核报告")).to_be_visible()
+    page.get_by_role("button", name="完成审核").click()
+    expect(page.get_by_role("dialog", name="确认完成审核")).to_be_visible()
     page.keyboard.press("Escape")
-    expect(page.get_by_role("dialog", name="确认提交审核报告")).to_be_hidden()
-    expect(page.get_by_role("button", name="提交报告")).to_be_focused()
+    expect(page.get_by_role("dialog", name="确认完成审核")).to_be_hidden()
+    expect(page.get_by_role("button", name="完成审核")).to_be_focused()
     assert post_count == 0
 
 
@@ -339,12 +344,99 @@ def test_sign_off_conflict_refreshes_without_replaying_old_mutation(
 
     _mock_review(page, snapshot, conflict)
     page.goto(f"{live_server_url}/?review=review-ui")
-    page.get_by_role("button", name="提交报告").click()
+    page.get_by_role("button", name="完成审核").click()
     page.get_by_label("我已核对全部审核项").check()
-    page.get_by_role("button", name="确认签署").click()
-    expect(page.locator("#workbench-notice")).to_have_text("审核状态已被更新，请重新确认当前项目")
-    expect(page.get_by_role("dialog", name="确认提交审核报告")).to_be_hidden()
+    page.get_by_role("button", name="确认完成").click()
+    expect(page.locator("#workbench-notice")).to_have_text("状态已更新，请重新确认")
+    expect(page.get_by_role("dialog", name="确认完成审核")).to_be_hidden()
     assert post_count == 1
+
+
+def test_signed_review_previews_then_confirms_writeback(
+    page: Page, live_server_url: str
+) -> None:
+    signed = _review(status="SIGNED_OFF")
+    signed["findings"][0]["status"] = "ACCEPTED"
+    posts = []
+    prepared = {
+        **signed,
+        "version": 4,
+        "writebackStatus": "PREPARED",
+        "writebackJob": {
+            "jobId": "writeback-review-ui-3",
+            "reviewVersion": 3,
+            "expectedVersion": 3,
+            "bundleHash": "a" * 64,
+            "resources": [
+                {"resourceType": "DetectedIssue", "id": "mr-di-1", "findingId": "finding-1", "summary": "Verified issue"},
+                {"resourceType": "Task", "id": "mr-task-1", "summary": "Missing pregnancy status"},
+            ],
+            "warnings": ["Synthetic data only"],
+            "blockedFindings": [{"findingId": "blocked-1", "reason": "MISSING_PAIRED_EVIDENCE"}],
+        },
+    }
+    committed = {
+        **prepared,
+        "version": 5,
+        "writebackStatus": "COMMITTED",
+        "writebackJob": {
+            **prepared["writebackJob"],
+            "result": {
+                "committed": True,
+                "created": ["DetectedIssue/mr-di-1", "Task/mr-task-1"],
+            },
+        },
+    }
+
+    def lifecycle(route: Route) -> None:
+        posts.append((route.request.url, route.request.post_data_json))
+        body = committed if route.request.url.endswith("/commit") else prepared
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
+
+    _mock_review(page, signed, lifecycle)
+    page.goto(f"{live_server_url}/?review=review-ui")
+    page.get_by_role("button", name="生成写回预览").click()
+    preview = page.locator("#writeback-preview")
+    expect(preview).to_contain_text("DetectedIssue")
+    expect(preview).to_contain_text("Task")
+    expect(preview).to_contain_text("bundleHash")
+    page.get_by_role("button", name="确认写回").click()
+    dialog = page.get_by_role("dialog", name="确认 FHIR 写回")
+    expect(dialog).to_contain_text("只新增资源，不修改原始临床记录")
+    expect(page.locator("#confirm-writeback")).to_be_disabled()
+    page.get_by_label("我确认写回以上 FHIR 资源").check()
+    page.locator("#confirm-writeback").click()
+
+    assert posts[-1][0].endswith("/writeback/commit")
+    assert posts[-1][1]["confirmed"] is True
+    expect(page.locator("#writeback-result")).to_contain_text("写回完成")
+
+
+def test_writeback_preview_renders_untrusted_summary_as_text(
+    page: Page, live_server_url: str
+) -> None:
+    snapshot = _review(status="SIGNED_OFF")
+    snapshot["writebackStatus"] = "PREPARED"
+    snapshot["writebackJob"] = {
+        "jobId": "writeback-review-ui-3",
+        "reviewVersion": 3,
+        "expectedVersion": 3,
+        "bundleHash": "a" * 64,
+        "resources": [{
+            "resourceType": "Task",
+            "id": "mr-task-1",
+            "summary": '<img src=x onerror="window.previewPwned=true">',
+        }],
+        "warnings": [],
+        "blockedFindings": [],
+    }
+    _mock_review(page, snapshot)
+
+    page.goto(f"{live_server_url}/?review=review-ui")
+
+    expect(page.locator("#writeback-preview")).to_contain_text("<img src=x")
+    assert page.locator("#writeback-preview img").count() == 0
+    assert page.evaluate("window.previewPwned") is None
 
 
 def test_audit_timeline_discloses_only_operational_metadata(

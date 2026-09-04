@@ -39,4 +39,31 @@ export const sendDecision = (reviewId, payload) => request(
   },
 );
 
+export const completeReview = (reviewId, payload) => request(
+  `/api/reviews/${encodeURIComponent(reviewId)}/complete`,
+  {
+    method: "POST",
+    headers: { "x-reviewer-id": payload.reviewerId },
+    body: JSON.stringify(payload),
+  },
+);
+
+export const prepareWriteback = (reviewId, payload) => request(
+  `/api/reviews/${encodeURIComponent(reviewId)}/writeback/prepare`,
+  {
+    method: "POST",
+    headers: { "x-reviewer-id": payload.reviewerId },
+    body: JSON.stringify(payload),
+  },
+);
+
+export const commitWriteback = (reviewId, payload) => request(
+  `/api/reviews/${encodeURIComponent(reviewId)}/writeback/commit`,
+  {
+    method: "POST",
+    headers: { "x-reviewer-id": payload.reviewerId },
+    body: JSON.stringify(payload),
+  },
+);
+
 export const getAudit = (reviewId) => request(`/api/reviews/${encodeURIComponent(reviewId)}/audit`);

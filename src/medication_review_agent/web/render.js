@@ -6,8 +6,8 @@ const STATUS_LABELS = {
   AWAITING_FINDING_REVIEW: "等待审核",
   NEEDS_MORE_EVIDENCE: "等待补充证据",
   BLOCKED_TOOL_ERROR: "工具异常，审核阻塞",
-  READY_FOR_SIGN_OFF: "待签署",
-  SIGNED_OFF: "已签署",
+  READY_FOR_SIGN_OFF: "待完成审核",
+  SIGNED_OFF: "审核已完成",
   CANCELLED: "已取消",
 };
 
@@ -118,10 +118,10 @@ export function renderSignOffDialog(review, onConfirm, onClose) {
       "aria-labelledby": titleId,
     },
   });
-  const title = element("h2", { id: titleId, text: "确认提交审核报告" });
+  const title = element("h2", { id: titleId, text: "确认完成审核" });
   const summary = element("p", {
     className: "dialog-guidance",
-    text: "提交后将生成签署报告，请确认已逐项核对当前审核结果。",
+    text: "完成后审核结论将被锁定，随后可生成 FHIR 写回预览。",
   });
   const countList = element("div", { className: "sign-off-counts", attrs: { "aria-label": "审核计数" } });
   [["接受", counts.accepted], ["排除", counts.rejected], ["未映射", counts.unmapped], ["证据缺口", counts.evidenceGaps]].forEach(([label, count]) => {
@@ -138,7 +138,7 @@ export function renderSignOffDialog(review, onConfirm, onClose) {
   confirmationLabel.append(confirmation, element("span", { text: "我已核对全部审核项" }));
   const actions = element("div", { className: "dialog-actions" });
   const cancel = element("button", { type: "button", text: "取消" });
-  const confirm = element("button", { className: "primary", type: "button", text: "确认签署" });
+  const confirm = element("button", { className: "primary", type: "button", text: "确认完成" });
   confirm.disabled = true;
   const updateConfirmState = () => {
     confirm.disabled = !confirmation.checked || !reviewerInput.value.trim();
@@ -151,6 +151,115 @@ export function renderSignOffDialog(review, onConfirm, onClose) {
   });
   actions.append(cancel, confirm);
   dialog.append(title, summary, countList, reviewerLabel, reviewerInput, confirmationLabel, actions);
+  return dialog;
+}
+
+export function renderWritebackPreview(target, review) {
+  clear(target);
+  const job = review?.writebackJob;
+  if (!job) return;
+  target.className = "writeback-section";
+  target.append(heading(`FHIR 写回预览 · ${(job.resources || []).length} 个资源`, 3));
+  target.append(definitionList([
+    ["患者", review.patientRef],
+    ["审核药师", document.querySelector("#reviewer-id")?.value.trim()],
+    ["reviewVersion", job.reviewVersion],
+    ["bundleHash", job.bundleHash],
+  ]));
+  const table = element("table", { className: "writeback-table" });
+  const head = element("thead");
+  head.append(element("tr", {}, [
+    element("th", { text: "资源类型" }),
+    element("th", { text: "资源 ID" }),
+    element("th", { text: "来源与原因" }),
+  ]));
+  const body = element("tbody");
+  (job.resources || []).forEach((resource) => {
+    const source = [
+      resource.findingId,
+      resource.unresolvedItemId,
+      resource.summary,
+      ...(resource.medicationRefs || []),
+      ...(resource.evidenceRefs || []),
+    ].filter(Boolean).join(" · ");
+    body.append(element("tr", {}, [
+      element("td", { text: resource.resourceType || "未记录" }),
+      element("td", { className: "mono", text: resource.id || "未记录" }),
+      element("td", { text: source || "详见已审核 Finding 与证据" }),
+    ]));
+  });
+  table.append(head, body);
+  target.append(table);
+  if ((job.warnings || []).length) {
+    target.append(heading("警告", 3));
+    const warnings = element("ul");
+    job.warnings.forEach((warning) => warnings.append(element("li", { text: warning })));
+    target.append(warnings);
+  }
+  if ((job.blockedFindings || []).length) {
+    target.append(heading("未写回 Finding", 3));
+    const blocked = element("ul");
+    job.blockedFindings.forEach((item) => blocked.append(element("li", {
+      text: `${item.findingId || "未记录"} · ${item.reason || "原因未记录"}`,
+    })));
+    target.append(blocked);
+  }
+}
+
+export function renderWritebackResult(target, review) {
+  clear(target);
+  if (review?.writebackStatus === "FAILED" && review.writebackError) {
+    target.className = "writeback-result is-error";
+    target.append(
+      heading("写回失败", 3),
+      element("p", { text: `${review.writebackError.code}: ${review.writebackError.message}` }),
+    );
+    return;
+  }
+  const result = review?.writebackJob?.result;
+  if (review?.writebackStatus !== "COMMITTED" || !result) return;
+  target.className = "writeback-result is-success";
+  target.append(
+    heading("写回完成", 3),
+    element("p", {
+      text: `${(result.created || []).length} 个 FHIR 资源已新增${result.idempotentReplay ? "（幂等重放）" : ""}。`,
+    }),
+  );
+}
+
+export function renderWritebackDialog(review, reviewerId, onConfirm, onClose) {
+  const job = review.writebackJob;
+  const titleId = "writeback-dialog-title";
+  const dialog = element("div", {
+    className: "sign-off-dialog writeback-dialog",
+    attrs: { role: "dialog", "aria-modal": "true", "aria-labelledby": titleId },
+  });
+  dialog.append(
+    element("h2", { id: titleId, text: "确认 FHIR 写回" }),
+    element("p", { className: "dialog-guidance", text: "只新增资源，不修改原始临床记录。" }),
+    definitionList([
+      ["患者", review.patientRef],
+      ["审核药师", reviewerId],
+      ["资源数量", (job.resources || []).length],
+      ["bundleHash", job.bundleHash],
+    ]),
+  );
+  const confirmationLabel = element("label", { className: "dialog-checkbox" });
+  const confirmation = element("input", { type: "checkbox", id: "writeback-confirmed" });
+  confirmationLabel.append(confirmation, element("span", { text: "我确认写回以上 FHIR 资源" }));
+  const actions = element("div", { className: "dialog-actions" });
+  const cancel = element("button", { type: "button", text: "取消" });
+  const confirm = element("button", {
+    id: "confirm-writeback", className: "primary", type: "button", text: "确认写回",
+  });
+  confirm.disabled = true;
+  confirmation.addEventListener("change", () => { confirm.disabled = !confirmation.checked; });
+  cancel.addEventListener("click", onClose);
+  confirm.addEventListener("click", () => {
+    if (!confirm.disabled) onConfirm();
+  });
+  actions.append(cancel, confirm);
+  dialog.append(confirmationLabel, actions);
   return dialog;
 }
 
@@ -329,7 +438,13 @@ export function renderReviewQueue(review, target, selectedFindingId, onSelectFin
   const medications = review.medications || [];
   if (medications.length) {
     const medicationSection = element("section", { className: "queue-section" });
-    medicationSection.append(heading("当前用药", 3));
+    medicationSection.append(
+      heading("活动用药医嘱", 3),
+      element("p", {
+        className: "decision-guidance",
+        text: "活动医嘱来自当前存储状态，不等于患者实际正在服药。",
+      }),
+    );
     medications.forEach((medication) => {
       const mapping = (review.medicationMappings || []).find((item) => item.medicationId === medication.medicationId);
       medicationSection.append(medicationRow(medication, mapping));

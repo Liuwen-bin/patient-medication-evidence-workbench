@@ -13,8 +13,11 @@
       <span id="review-status" class="status-text">未开始</span>
     </div>
     <div class="topbar-actions">
-      <button id="run-review" type="button">开始复核</button>
-      <button id="sign-report" type="button" disabled>提交报告</button>
+      <button id="start-review" type="button">开始复核</button>
+      <button id="complete-review" type="button" disabled>完成审核</button>
+      <button id="prepare-writeback" type="button" disabled>生成写回预览</button>
+      <button id="open-writeback-confirmation" type="button" disabled>确认写回</button>
+      <span id="report-exports" class="report-exports" aria-label="报告导出"></span>
     </div>
   </header>
   <form id="patient-form" class="patient-selector">
@@ -35,7 +38,11 @@
   <main class="workbench-grid">
     <section id="patient-panel" data-panel="patient" class="is-active" aria-label="患者上下文"></section>
     <section id="review-queue" data-panel="queue" aria-label="审核任务队列"></section>
-    <aside id="evidence-panel" data-panel="evidence" aria-label="证据核对"></aside>
+    <aside id="evidence-panel" data-panel="evidence" aria-label="证据核对">
+      <section id="evidence-detail"></section>
+      <section id="writeback-preview" aria-live="polite"></section>
+      <section id="writeback-result" aria-live="polite"></section>
+    </aside>
   </main>
   <div id="dialog-root"></div>
   <div id="live-region" class="sr-only" aria-live="polite"></div>
