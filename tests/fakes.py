@@ -47,10 +47,42 @@ class FakeHealthGateway:
     def __init__(self, response: TimedToolResult) -> None:
         self.response = response
         self.calls: list[tuple[str | None, str | None]] = []
+        self.validate_calls: list[dict[str, Any]] = []
+        self.commit_calls: list[tuple[str, str, int, bool]] = []
 
     async def get_review_context(self, patient_id: str | None, as_of: str | None) -> TimedToolResult:
         self.calls.append((patient_id, as_of))
         return self.response
+
+    async def validate_writeback(self, payload: dict[str, Any]) -> TimedToolResult:
+        self.validate_calls.append(payload)
+        version = payload["reviewVersion"]
+        return envelope("OK", {
+            "jobId": f"writeback-{payload['reviewId']}-{version}",
+            "reviewId": payload["reviewId"],
+            "reviewVersion": version,
+            "expectedVersion": version,
+            "patientRef": payload["patientRef"],
+            "bundleHash": "a" * 64,
+            "resources": [
+                {"resourceType": "DetectedIssue", "id": "mr-di-test"},
+                {"resourceType": "Provenance", "id": "mr-prov-test"},
+            ],
+            "warnings": [],
+            "blockedFindings": [],
+        })
+
+    async def commit_writeback(
+        self, job_id: str, bundle_hash: str, expected_version: int, confirmed: bool,
+    ) -> TimedToolResult:
+        self.commit_calls.append((job_id, bundle_hash, expected_version, confirmed))
+        return envelope("OK", {
+            "jobId": job_id,
+            "committed": True,
+            "idempotentReplay": len(self.commit_calls) > 1,
+            "bundleHash": bundle_hash,
+            "created": ["DetectedIssue/mr-di-test", "Provenance/mr-prov-test"],
+        })
 
 
 class FakeDrugGateway:

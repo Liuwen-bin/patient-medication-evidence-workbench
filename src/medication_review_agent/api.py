@@ -8,7 +8,7 @@ import os
 import pickle
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request, Response, status
@@ -18,14 +18,20 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
-from .gateways import DrugEvidenceGateway, HealthRecordGateway
+from .gateways import DrugEvidenceGateway, HealthRecordGateway, ToolContractError
 from .planner import build_planner_from_env
-from .models import AuditEvent, ReviewStatus
+from .models import (
+    AuditEvent,
+    ReviewStatus,
+    WritebackFailure,
+    WritebackStatus,
+)
 from .report import ReportNotSigned, build_signed_report, render_report_html, render_report_json
 from .repository import ReviewNotFound, ReviewRepository, ReviewVersionConflict
 from .retrieval import build_grader_from_env
 from .safety import QuestionSafetyDecision, evaluate_review_question
 from .workflow import ReviewDependencies, build_review_graph, open_sqlite_checkpointer, state_to_snapshot
+from .writeback import WritebackCoordinator, WritebackError, WritebackStateError
 
 
 WEB_DIR = Path(__file__).with_name("web")
@@ -98,6 +104,20 @@ class CancelRequest(BaseModel):
     expectedVersion: int = Field(ge=0)
 
 
+class CompleteReviewRequest(BaseModel):
+    expectedVersion: int = Field(ge=0)
+    reviewerId: str = Field(min_length=1, max_length=100)
+
+
+class PrepareWritebackRequest(CompleteReviewRequest):
+    pass
+
+
+class CommitWritebackRequest(CompleteReviewRequest):
+    bundleHash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    confirmed: Literal[True]
+
+
 def validate_bind_settings(host: str, *, allow_remote: bool, api_key: str) -> None:
     if host in {"127.0.0.1", "localhost", "::1"}:
         return
@@ -164,6 +184,25 @@ def create_app(
             return dependencies.repository.get(review_id)
         except ReviewNotFound as exc:
             raise HTTPException(404, "Review not found") from exc
+
+    def require_reviewer(
+        body_reviewer_id: str, header_reviewer_id: str | None
+    ) -> None:
+        if configured_key and not configured_reviewer_id:
+            raise HTTPException(
+                503, "REVIEW_API_REVIEWER_ID is required for reviewer decisions"
+            )
+        if (
+            not header_reviewer_id
+            or header_reviewer_id != body_reviewer_id
+            or (
+                configured_reviewer_id
+                and header_reviewer_id != configured_reviewer_id
+            )
+        ):
+            raise HTTPException(
+                403, "Reviewer identity does not match configured reviewer"
+            )
 
     def persist(review_id: str, graph_state: dict[str, Any], expected_version: int):
         existing = get_review(review_id)
@@ -342,14 +381,7 @@ def create_app(
 
     @app.post("/api/reviews/{review_id}/decisions")
     async def decide(review_id: str, body: DecisionRequest, x_reviewer_id: str | None = Header(default=None)):
-        if configured_key and not configured_reviewer_id:
-            raise HTTPException(503, "REVIEW_API_REVIEWER_ID is required for reviewer decisions")
-        if (
-            not x_reviewer_id
-            or x_reviewer_id != body.reviewerId
-            or (configured_reviewer_id and x_reviewer_id != configured_reviewer_id)
-        ):
-            raise HTTPException(403, "Reviewer identity header does not match decision")
+        require_reviewer(body.reviewerId, x_reviewer_id)
         lock = await review_lock(review_id)
         async with lock:
             try:
@@ -371,7 +403,7 @@ def create_app(
                 raise HTTPException(409, "Review version conflict")
             if snapshot.status.value not in {
                 "AWAITING_PATIENT_CONFIRMATION", "AWAITING_MAPPING_CONFIRMATION",
-                "AWAITING_FINDING_REVIEW", "NEEDS_MORE_EVIDENCE", "READY_FOR_SIGN_OFF",
+                "AWAITING_FINDING_REVIEW", "NEEDS_MORE_EVIDENCE",
             }:
                 raise HTTPException(409, "Review is not awaiting a decision")
             question_safety = evaluate_review_question(snapshot.question)
@@ -388,6 +420,177 @@ def create_app(
                 )
             except (ValueError, TypeError) as exc:
                 raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/reviews/{review_id}/complete")
+    async def complete_review(
+        review_id: str,
+        body: CompleteReviewRequest,
+        x_reviewer_id: str | None = Header(default=None),
+    ):
+        require_reviewer(body.reviewerId, x_reviewer_id)
+        lock = await review_lock(review_id)
+        async with lock:
+            await recover_pending(review_id)
+            snapshot = get_review(review_id)
+            if snapshot.version != body.expectedVersion:
+                raise HTTPException(409, "Review version conflict")
+            if snapshot.status != ReviewStatus.READY_FOR_SIGN_OFF:
+                raise HTTPException(409, "Review is not ready for completion")
+            payload = {"action": "SIGN_OFF", "reviewerId": body.reviewerId}
+            try:
+                return await mutate(
+                    review_id,
+                    expected_version=body.expectedVersion,
+                    payload=payload,
+                    command=Command(resume=payload),
+                )
+            except (ValueError, TypeError) as exc:
+                raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/reviews/{review_id}/writeback/prepare")
+    async def prepare_writeback(
+        review_id: str,
+        body: PrepareWritebackRequest,
+        x_reviewer_id: str | None = Header(default=None),
+    ):
+        require_reviewer(body.reviewerId, x_reviewer_id)
+        lock = await review_lock(review_id)
+        async with lock:
+            await recover_pending(review_id)
+            snapshot = get_review(review_id)
+            if snapshot.version != body.expectedVersion:
+                raise HTTPException(409, "Review version conflict")
+            if snapshot.status != ReviewStatus.SIGNED_OFF:
+                raise HTTPException(409, "Review must be completed before writeback")
+            if snapshot.writebackStatus not in {
+                WritebackStatus.NOT_REQUESTED,
+                WritebackStatus.FAILED,
+            }:
+                raise HTTPException(409, "Writeback preview already exists")
+            coordinator = WritebackCoordinator(dependencies.health)
+            try:
+                job = await coordinator.prepare(snapshot, body.reviewerId)
+            except WritebackStateError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            except (WritebackError, ToolContractError) as exc:
+                failure = (
+                    WritebackFailure(
+                        code=exc.code,
+                        message=str(exc),
+                        retryable=exc.retryable,
+                    )
+                    if isinstance(exc, WritebackError)
+                    else WritebackFailure(
+                        code="HEALTH_MCP_CONTRACT_ERROR",
+                        message=str(exc),
+                        retryable=True,
+                    )
+                )
+                failed = snapshot.model_copy(deep=True)
+                failed.writebackStatus = WritebackStatus.FAILED
+                failed.writebackError = failure
+                try:
+                    dependencies.repository.save(
+                        failed, expected_version=body.expectedVersion
+                    )
+                except ReviewVersionConflict as conflict:
+                    raise HTTPException(409, "Review version conflict") from conflict
+                raise HTTPException(502 if failure.retryable else 422, failure.message)
+            prepared = snapshot.model_copy(deep=True)
+            prepared.writebackStatus = WritebackStatus.PREPARED
+            prepared.writebackJob = job
+            prepared.writebackError = None
+            try:
+                return dependencies.repository.save(
+                    prepared, expected_version=body.expectedVersion
+                )
+            except ReviewVersionConflict as exc:
+                raise HTTPException(409, "Review version conflict") from exc
+
+    @app.post("/api/reviews/{review_id}/writeback/commit")
+    async def commit_writeback(
+        review_id: str,
+        body: CommitWritebackRequest,
+        x_reviewer_id: str | None = Header(default=None),
+    ):
+        require_reviewer(body.reviewerId, x_reviewer_id)
+        lock = await review_lock(review_id)
+        async with lock:
+            await recover_pending(review_id)
+            snapshot = get_review(review_id)
+            if snapshot.version != body.expectedVersion:
+                raise HTTPException(409, "Review version conflict")
+            if snapshot.status != ReviewStatus.SIGNED_OFF:
+                raise HTTPException(409, "Review must remain completed for writeback")
+            if snapshot.writebackJob is None or snapshot.writebackStatus not in {
+                WritebackStatus.PREPARED,
+                WritebackStatus.FAILED,
+                WritebackStatus.COMMITTED,
+            }:
+                raise HTTPException(409, "Writeback preview is not prepared")
+            if body.bundleHash != snapshot.writebackJob.bundleHash:
+                raise HTTPException(409, "Writeback bundle hash conflict")
+            coordinator = WritebackCoordinator(dependencies.health)
+            try:
+                result = await coordinator.commit(
+                    snapshot.writebackJob, confirmed=body.confirmed
+                )
+            except (WritebackError, ToolContractError) as exc:
+                failure = (
+                    WritebackFailure(
+                        code=exc.code,
+                        message=str(exc),
+                        retryable=exc.retryable,
+                    )
+                    if isinstance(exc, WritebackError)
+                    else WritebackFailure(
+                        code="HEALTH_MCP_CONTRACT_ERROR",
+                        message=str(exc),
+                        retryable=True,
+                    )
+                )
+                failed = snapshot.model_copy(deep=True)
+                failed.writebackStatus = WritebackStatus.FAILED
+                failed.writebackError = failure
+                try:
+                    dependencies.repository.save(
+                        failed, expected_version=body.expectedVersion
+                    )
+                except ReviewVersionConflict as conflict:
+                    raise HTTPException(409, "Review version conflict") from conflict
+                raise HTTPException(502 if failure.retryable else 422, failure.message)
+            committed = snapshot.model_copy(deep=True)
+            committed.writebackStatus = WritebackStatus.COMMITTED
+            committed.writebackJob.result = result
+            committed.writebackError = None
+            try:
+                saved = dependencies.repository.save(
+                    committed, expected_version=body.expectedVersion
+                )
+            except ReviewVersionConflict as exc:
+                raise HTTPException(409, "Review version conflict") from exc
+            dependencies.repository.append_audit(
+                review_id,
+                node="commit_writeback",
+                tool="commit_medication_review_writeback",
+                request_id=None,
+                result_status="OK",
+                argument_summary={"evidenceCount": len(result.get("created") or [])},
+                evidence_refs=[],
+                latency_ms=0,
+            )
+            return saved
+
+    @app.get("/api/reviews/{review_id}/writeback")
+    def read_writeback(review_id: str):
+        snapshot = get_review(review_id)
+        return {
+            "reviewId": snapshot.reviewId,
+            "reviewVersion": snapshot.version,
+            "status": snapshot.writebackStatus,
+            "job": snapshot.writebackJob,
+            "error": snapshot.writebackError,
+        }
 
     @app.post("/api/reviews/{review_id}/cancel")
     async def cancel(review_id: str, body: CancelRequest, x_reviewer_id: str | None = Header(default=None)):

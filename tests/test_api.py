@@ -399,9 +399,101 @@ def test_signed_review_cannot_be_cancelled(client: TestClient) -> None:
     current = client.post(f"/api/reviews/{review_id}/run").json()
     decisions = [{"action": "ACCEPT_FINDING", "findingId": item["findingId"]} for item in current["findings"]]
     ready = client.post(f"/api/reviews/{review_id}/decisions", json={"expectedVersion": 1, "action": "COMPLETE_FINDING_REVIEW", "reviewerId": "pharmacist-demo", "decisions": decisions}).json()
-    signed = client.post(f"/api/reviews/{review_id}/decisions", json={"expectedVersion": ready["version"], "action": "SIGN_OFF", "reviewerId": "pharmacist-demo"}).json()
+    signed = client.post(f"/api/reviews/{review_id}/complete", json={
+        "expectedVersion": ready["version"], "reviewerId": "pharmacist-demo",
+    }).json()
     assert signed["status"] == "SIGNED_OFF"
     assert client.post(f"/api/reviews/{review_id}/cancel", json={"expectedVersion": signed["version"]}).status_code == 409
+
+
+def _signed_review(client: TestClient) -> dict:
+    created = client.post("/api/reviews", json={
+        "patientId": "P001", "question": DEFAULT_QUESTION,
+    }).json()
+    review_id = created["reviewId"]
+    current = client.post(f"/api/reviews/{review_id}/run").json()
+    if current["status"] in {"AWAITING_FINDING_REVIEW", "NEEDS_MORE_EVIDENCE"}:
+        current = client.post(f"/api/reviews/{review_id}/decisions", json={
+            "expectedVersion": current["version"],
+            "action": "COMPLETE_FINDING_REVIEW",
+            "reviewerId": "pharmacist-demo",
+            "decisions": [
+                {"action": "ACCEPT_FINDING", "findingId": item["findingId"]}
+                for item in current["findings"]
+                if item["status"] == "PENDING"
+            ],
+        }).json()
+    assert current["status"] == "READY_FOR_SIGN_OFF"
+    response = client.post(f"/api/reviews/{review_id}/complete", json={
+        "expectedVersion": current["version"], "reviewerId": "pharmacist-demo",
+    })
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_complete_review_resumes_final_human_interrupt(client: TestClient) -> None:
+    signed = _signed_review(client)
+
+    assert signed["status"] == "SIGNED_OFF"
+    assert signed["writebackStatus"] == "NOT_REQUESTED"
+
+
+def test_prepare_and_commit_writeback_lifecycle(client: TestClient) -> None:
+    signed = _signed_review(client)
+    review_id = signed["reviewId"]
+
+    prepared_response = client.post(
+        f"/api/reviews/{review_id}/writeback/prepare",
+        json={
+            "expectedVersion": signed["version"],
+            "reviewerId": "pharmacist-demo",
+        },
+    )
+    assert prepared_response.status_code == 200
+    prepared = prepared_response.json()
+    assert prepared["writebackStatus"] == "PREPARED"
+    assert prepared["writebackJob"]["bundleHash"] == "a" * 64
+
+    committed_response = client.post(
+        f"/api/reviews/{review_id}/writeback/commit",
+        json={
+            "expectedVersion": prepared["version"],
+            "reviewerId": "pharmacist-demo",
+            "bundleHash": prepared["writebackJob"]["bundleHash"],
+            "confirmed": True,
+        },
+    )
+    assert committed_response.status_code == 200
+    committed = committed_response.json()
+    assert committed["writebackStatus"] == "COMMITTED"
+    assert committed["writebackJob"]["result"]["committed"] is True
+
+    status_response = client.get(f"/api/reviews/{review_id}/writeback")
+    assert status_response.status_code == 200
+    assert status_response.json()["status"] == "COMMITTED"
+
+
+def test_writeback_rejects_stale_version_hash_and_reviewer_before_gateway(
+    client: TestClient,
+) -> None:
+    signed = _signed_review(client)
+    review_id = signed["reviewId"]
+
+    stale = client.post(f"/api/reviews/{review_id}/writeback/prepare", json={
+        "expectedVersion": signed["version"] - 1,
+        "reviewerId": "pharmacist-demo",
+    })
+    assert stale.status_code == 409
+
+    wrong_reviewer = client.post(
+        f"/api/reviews/{review_id}/writeback/prepare",
+        headers={"x-reviewer-id": "pharmacist-other"},
+        json={
+            "expectedVersion": signed["version"],
+            "reviewerId": "pharmacist-other",
+        },
+    )
+    assert wrong_reviewer.status_code == 403
 
 
 def test_app_factory_rejects_multi_worker_environment(monkeypatch) -> None:
