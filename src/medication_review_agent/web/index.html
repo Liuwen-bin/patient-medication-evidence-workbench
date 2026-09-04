@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>用药复核工作台</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="product-lockup">
+      <span class="product-name">用药复核工作台</span>
+      <span id="review-status" class="status-text">未开始</span>
+    </div>
+    <div class="topbar-actions">
+      <button id="run-review" type="button">开始复核</button>
+      <button id="sign-report" type="button" disabled>提交报告</button>
+    </div>
+  </header>
+  <form id="patient-form" class="patient-selector">
+    <label for="patient-id">患者编号或 FHIR ID</label>
+    <input id="patient-id" name="patientId" autocomplete="off" required>
+    <label for="as-of">审核日期</label>
+    <input id="as-of" name="asOf" type="date" required>
+    <label for="reviewer-id">审核药师</label>
+    <input id="reviewer-id" name="reviewerId" autocomplete="username" required value="pharmacist-demo">
+  </form>
+  <nav class="mobile-tabs" aria-label="工作区">
+    <button type="button" data-tab="patient" aria-selected="true">患者</button>
+    <button type="button" data-tab="queue" aria-selected="false">审核项</button>
+    <button type="button" data-tab="evidence" aria-selected="false">证据</button>
+  </nav>
+  <main class="workbench-grid">
+    <section id="patient-panel" data-panel="patient" class="is-active" aria-label="患者上下文"></section>
+    <section id="review-queue" data-panel="queue" aria-label="审核任务队列"></section>
+    <aside id="evidence-panel" data-panel="evidence" aria-label="证据核对"></aside>
+  </main>
+  <div id="dialog-root"></div>
+  <div id="live-region" class="sr-only" aria-live="polite"></div>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>
