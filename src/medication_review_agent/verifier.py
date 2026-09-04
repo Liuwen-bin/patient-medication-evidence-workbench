@@ -93,13 +93,21 @@ def verify_label_evidence_bindings(
             or not item.topic
             or not (item.summary or "").strip()
             or CONTENT_HASH.fullmatch(content_hash) is None
-            or item.evidenceId
-            != stable_evidence_id(
-                item.source,
-                item.evidenceRef,
-                document_version,
-                content_hash,
-            )
+            or item.evidenceId not in {
+                stable_evidence_id(
+                    item.source,
+                    item.evidenceRef,
+                    document_version,
+                    content_hash,
+                ),
+                stable_evidence_id(
+                    item.source,
+                    item.evidenceRef,
+                    document_version,
+                    content_hash,
+                    item.topic,
+                ),
+            }
         ):
             return ["invalid_label_evidence_binding"]
     if (

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import time
+import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -37,12 +39,66 @@ class StreamableHTTPMCPCaller:
         if parsed.scheme == "http" and parsed.hostname not in local_hosts and not allow_remote:
             raise ValueError("Remote plain HTTP MCP requires ALLOW_REMOTE_MCP=true")
         self.url = url
+        self._stack: AsyncExitStack | None = None
+        self._session: ClientSession | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._call_lock = asyncio.Lock()
+
+    async def __aenter__(self) -> "StreamableHTTPMCPCaller":
+        await self.open()
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        await self.aclose()
+
+    async def open(self) -> None:
+        async with self._lifecycle_lock:
+            if self._session is not None:
+                return
+            stack = AsyncExitStack()
+            try:
+                read_stream, write_stream, _ = await stack.enter_async_context(
+                    streamablehttp_client(self.url)
+                )
+                session = await stack.enter_async_context(
+                    ClientSession(read_stream, write_stream)
+                )
+                await session.initialize()
+            except BaseException:
+                await stack.aclose()
+                raise
+            self._stack = stack
+            self._session = session
+
+    async def aclose(self) -> None:
+        async with self._call_lock:
+            async with self._lifecycle_lock:
+                stack = self._stack
+                self._stack = None
+                self._session = None
+                if stack is not None:
+                    await stack.aclose()
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        async with streamablehttp_client(self.url) as (read_stream, write_stream, _):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
+        await self.open()
+        async with self._call_lock:
+            session = self._session
+            if session is None:  # pragma: no cover - guarded by open and the lock
+                raise RuntimeError("MCP session closed before tool call")
+            try:
                 result = await session.call_tool(name, arguments)
+            except BaseException:
+                async with self._lifecycle_lock:
+                    stack = self._stack if self._session is session else None
+                    if stack is not None:
+                        self._stack = None
+                        self._session = None
+                if stack is not None:
+                    try:
+                        await stack.aclose()
+                    except BaseException:
+                        pass
+                raise
         structured = getattr(result, "structuredContent", None)
         if isinstance(structured, dict):
             return structured

@@ -22,9 +22,13 @@ def stable_evidence_id(
     evidence_ref: str,
     document_version: str | None,
     content_hash: str | None,
+    topic: str | None = None,
 ) -> str:
+    identity_parts = [source, evidence_ref, document_version or "", content_hash or ""]
+    if topic is not None:
+        identity_parts.append(topic)
     identity = json.dumps(
-        [source, evidence_ref, document_version or "", content_hash or ""],
+        identity_parts,
         ensure_ascii=True,
         separators=(",", ":"),
     )
@@ -261,7 +265,11 @@ def _evidence_from_payload(
     content_hash = payload.get("contentHash")
     return EvidenceItem(
         evidenceId=stable_evidence_id(
-            "SPL", evidence_ref, document_version, content_hash,
+            "SPL",
+            evidence_ref,
+            document_version,
+            content_hash,
+            _payload_topic(payload, allowed_topics),
         ),
         source="SPL",
         evidenceRef=evidence_ref,

@@ -67,23 +67,10 @@ function Write-FailureReport {
 }
 
 function Test-TcpPort {
-    param([int]$Port, [int]$TimeoutMilliseconds = 500)
+    param([int]$Port)
 
-    $client = [System.Net.Sockets.TcpClient]::new()
-    try {
-        $async = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
-        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMilliseconds)) {
-            return $false
-        }
-        $client.EndConnect($async)
-        return $true
-    }
-    catch {
-        return $false
-    }
-    finally {
-        $client.Dispose()
-    }
+    return [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners().Port `
+        -contains $Port
 }
 
 function Wait-TcpPort {
@@ -97,6 +84,19 @@ function Wait-TcpPort {
         Start-Sleep -Milliseconds 500
     }
     throw [System.TimeoutException]::new("$ServiceName did not become ready on its expected port.")
+}
+
+function Wait-TcpPortClosed {
+    param([int]$Port, [string]$ServiceName, [int]$TimeoutSeconds = 15)
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not (Test-TcpPort -Port $Port)) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw [System.TimeoutException]::new("$ServiceName did not release its expected port.")
 }
 
 function Assert-LiveEvaluationPortsAvailable {
@@ -123,6 +123,16 @@ function Start-OwnedProcess {
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     $startedProcesses.Add($process)
     return $process
+}
+
+function Stop-OwnedProcess {
+    param([System.Diagnostics.Process]$Process)
+
+    $Process.Refresh()
+    if (-not $Process.HasExited) {
+        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+        $Process.WaitForExit(10000) | Out-Null
+    }
 }
 
 if ($CheckPortsOnly) {
@@ -182,7 +192,7 @@ try {
 
     $stage = "start_drug_mcp"
     Start-OwnedProcess -Name "drug-mcp" -WorkingDirectory $DrugRoot `
-        -Arguments @("-m", "dailymed_lightrag.drug_mcp_server", "--transport", "http", "--host", "127.0.0.1", "--port", "8010") | Out-Null
+        -Arguments @("-m", "medication_review_agent.dailymed_compat", "--transport", "http", "--host", "127.0.0.1", "--port", "8010") | Out-Null
     Wait-TcpPort -Port 8010 -ServiceName "Drug MCP"
 
     $stage = "start_review_api"
@@ -202,16 +212,17 @@ try {
             "The fixed Milvus fault endpoint is unexpectedly reachable."
         )
     }
-    [ordered]@{
-        profile = "rag-unavailable"
-        dependency = "milvus"
-        fault = "endpoint_unreachable"
-        configuredEndpoint = $ragFaultUri
-        observedUnavailable = $true
-    } | ConvertTo-Json | Set-Content -LiteralPath $ragFaultAttestation -Encoding UTF8
+    $faultProxyProcess = Start-OwnedProcess -Name "milvus-fault-proxy" `
+        -WorkingDirectory $DrugRoot `
+        -Arguments @(
+            "-m", "medication_review_agent.fault_proxy",
+            "--listen-host", "127.0.0.1",
+            "--listen-port", "$ragFaultPort"
+        )
+    Wait-TcpPort -Port $ragFaultPort -ServiceName "Milvus fault proxy"
     $env:MILVUS_URI = $ragFaultUri
     Start-OwnedProcess -Name "drug-mcp-rag-unavailable" -WorkingDirectory $DrugRoot `
-        -Arguments @("-m", "dailymed_lightrag.drug_mcp_server", "--transport", "http", "--host", "127.0.0.1", "--port", "8011") | Out-Null
+        -Arguments @("-m", "medication_review_agent.dailymed_compat", "--transport", "http", "--host", "127.0.0.1", "--port", "8011") | Out-Null
     Wait-TcpPort -Port 8011 -ServiceName "Degraded Drug MCP"
     $env:DRUG_MCP_URL = "http://127.0.0.1:8011/mcp"
     $env:REVIEW_API_PORT = "8021"
@@ -224,6 +235,15 @@ try {
     if ($degradedHealth.status -ne "healthy") {
         throw [System.InvalidOperationException]::new("Degraded Review API health contract failed.")
     }
+    Stop-OwnedProcess -Process $faultProxyProcess
+    Wait-TcpPortClosed -Port $ragFaultPort -ServiceName "Milvus fault proxy"
+    [ordered]@{
+        profile = "rag-unavailable"
+        dependency = "milvus"
+        fault = "endpoint_unreachable"
+        configuredEndpoint = $ragFaultUri
+        observedUnavailable = $true
+    } | ConvertTo-Json | Set-Content -LiteralPath $ragFaultAttestation -Encoding UTF8
     if ([string]::IsNullOrEmpty($priorMilvusUri)) {
         Remove-Item Env:MILVUS_URI -ErrorAction SilentlyContinue
     } else {
@@ -267,9 +287,7 @@ finally {
         $env:MILVUS_URI = $priorMilvusUri
     }
     foreach ($process in $startedProcesses) {
-        if (-not $process.HasExited) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        }
+        Stop-OwnedProcess -Process $process
     }
     if ($null -ne $sourceHashBefore) {
         $sourceDatabaseChanged = $false

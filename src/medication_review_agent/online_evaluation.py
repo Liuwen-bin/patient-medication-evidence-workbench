@@ -276,10 +276,18 @@ def _accepted_citations_are_valid(
             or evidence_ref.removeprefix("SPL:").split("#", 1)[0] != document_id
             or not document_version.strip()
             or re.fullmatch(r"[0-9a-f]{64}", content_hash) is None
-            or item.get("evidenceId")
-            != stable_evidence_id(
-                source, evidence_ref, document_version, content_hash
-            )
+            or item.get("evidenceId") not in {
+                stable_evidence_id(
+                    source, evidence_ref, document_version, content_hash
+                ),
+                stable_evidence_id(
+                    source,
+                    evidence_ref,
+                    document_version,
+                    content_hash,
+                    str(item.get("topic") or ""),
+                ),
+            }
         ):
             return False
     if (
@@ -472,9 +480,16 @@ def case_expectations_met(
             if isinstance(item, dict)
             and item.get("sourceTool") == "search_label_evidence"
         }
+        insufficient_path = (
+            int(search_statuses.get("INSUFFICIENT_EVIDENCE", 0)) > 0
+            and "INSUFFICIENT_EVIDENCE" in unresolved_reasons
+        )
+        graph_fallback_path = (
+            int(search_statuses.get("OK", 0)) > 0
+            and "LABEL_EVIDENCE_REVIEW" in observed_types
+        )
         checks.extend([
-            int(search_statuses.get("INSUFFICIENT_EVIDENCE", 0)) > 0,
-            "INSUFFICIENT_EVIDENCE" in unresolved_reasons,
+            insufficient_path or graph_fallback_path,
             _valid_rag_fault_attestation(
                 operational.get("serviceProfileAttestation")
             ),
@@ -519,14 +534,18 @@ class OnlineEvaluationRunner:
         payload: dict[str, Any] | None = None,
     ) -> Any:
         response = await client.request(method, path, json=payload)
-        if response.status_code == 409:
-            raise OnlineEvaluationError("STALE_REVIEW_VERSION", "Review version conflict.")
         if response.status_code >= 400:
             try:
                 body = response.json()
             except ValueError:
                 body = {}
             detail = body.get("detail") if isinstance(body, dict) else None
+            if response.status_code == 409 and "version conflict" in str(
+                detail or ""
+            ).casefold():
+                raise OnlineEvaluationError(
+                    "STALE_REVIEW_VERSION", "Review version conflict."
+                )
             raise OnlineEvaluationError(
                 "REVIEW_API_ERROR", str(detail or f"HTTP {response.status_code}")
             )

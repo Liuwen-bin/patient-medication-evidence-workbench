@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from medication_review_agent.api import validate_bind_settings, validate_worker_count
 from medication_review_agent.api import build_app_from_env, create_app
+from medication_review_agent.gateways import DrugEvidenceGateway, HealthRecordGateway
 from medication_review_agent.planner import DeterministicPlanner
 from medication_review_agent.models import ReviewStatus
 from medication_review_agent.repository import ReviewRepository
@@ -38,6 +39,39 @@ def test_create_review_requires_question(client: TestClient) -> None:
     response = client.post("/api/reviews", json={"patientId": "P001"})
 
     assert response.status_code == 422
+
+
+def test_app_lifespan_owns_mcp_gateway_sessions(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ALLOW_INSECURE_LOCAL_MUTATIONS", "true")
+    events: list[str] = []
+
+    class LifecycleCaller:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def __aenter__(self):
+            events.append(f"enter:{self.name}")
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            events.append(f"exit:{self.name}")
+
+    dependencies = ReviewDependencies(
+        health=HealthRecordGateway(LifecycleCaller("health")),
+        drug=DrugEvidenceGateway(LifecycleCaller("drug")),
+        repository=ReviewRepository(tmp_path / "reviews.sqlite"),
+        planner=DeterministicPlanner(),
+    )
+    app = create_app(
+        dependencies,
+        checkpoint_path=tmp_path / "checkpoints.sqlite",
+    )
+
+    with TestClient(app) as isolated:
+        assert isolated.get("/api/health").status_code == 200
+        assert events == ["enter:health", "enter:drug"]
+
+    assert events == ["enter:health", "enter:drug", "exit:drug", "exit:health"]
 
 
 def test_create_review_rejects_blank_question(client: TestClient) -> None:

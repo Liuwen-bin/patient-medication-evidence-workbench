@@ -202,6 +202,7 @@ def _upsert_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 evidence_ref,
                 str(item.get("documentVersion") or ""),
                 str(item.get("contentHash") or ""),
+                str(item.get("topic") or ""),
             )
         else:
             identity = (
@@ -369,24 +370,8 @@ def deidentified_patient_features(context: dict[str, Any]) -> dict[str, Any]:
 def relevant_missing_fields(
     topics: list[ReviewTopic], missing_fields: list[str],
 ) -> list[str]:
-    topic_values = {topic.value for topic in topics}
-
-    def relevant(field: str) -> bool:
-        return (
-            (ReviewTopic.WARNINGS.value in topic_values and field == "allergies")
-            or (ReviewTopic.ROUTE.value in topic_values and field.endswith(".route"))
-            or (
-                ReviewTopic.DOSAGE_FORM.value in topic_values
-                and field.endswith(".dosageForm")
-            )
-            or (ReviewTopic.DOSAGE.value in topic_values and field.endswith(".dosage"))
-            or (
-                ReviewTopic.PREGNANCY.value in topic_values
-                and field == "specialPopulations"
-            )
-        )
-
-    return sorted({field for field in missing_fields if relevant(field)})
+    del topics
+    return sorted({field for field in missing_fields if field})
 
 
 def _reinvestigation_kind(finding: dict[str, Any] | None) -> str:
@@ -1492,18 +1477,46 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
         all_requested_ids = list(state.get("reinvestigateFindingIds") or [])
         requested_ids = set(_reinvestigation_ids(state, "context"))
         missing = set(result.envelope.data.get("missingFields", []))
+        previous_missing = set(state.get("contextMissingFields", []))
+        changed_missing = missing.symmetric_difference(previous_missing)
         for item in findings:
-            if item.get("findingId") not in requested_ids:
+            missing_field = item.get("missingField")
+            if not missing_field or (
+                item.get("findingId") not in requested_ids
+                and missing_field not in changed_missing
+            ):
                 continue
             item["verificationErrors"] = []
-            still_missing = item.get("missingField") in missing
+            still_missing = missing_field in missing
             item["stillMissing"] = still_missing
             if still_missing:
                 item["status"] = FindingStatus.PENDING.value
+                item["summary"] = (
+                    f"Patient information is not recorded: {missing_field}."
+                )
+                item.pop("resolution", None)
             else:
                 item["status"] = FindingStatus.REJECTED.value
-                item["summary"] = f"Resolved: patient information is now recorded: {item.get('missingField')}."
+                item["summary"] = f"Resolved: patient information is now recorded: {missing_field}."
                 item["resolution"] = "RESOLVED_BY_CONTEXT_REFRESH"
+        newly_missing = missing - previous_missing
+        existing_missing = {
+            item.get("missingField") for item in findings if item.get("missingField")
+        }
+        findings.extend(
+            make_finding(
+                rule_id="missing-patient-field-v1",
+                comparison_inputs={"missingField": missing_field},
+                findingId=str(uuid4()),
+                reviewType="EVIDENCE_GAP",
+                summary=f"Patient information is not recorded: {missing_field}.",
+                attentionLevel="HIGH",
+                confidence=1.0,
+                requiresHumanReview=True,
+                missingField=missing_field,
+            ).model_dump(mode="json")
+            for missing_field in sorted(newly_missing - existing_missing)
+        )
         context = result.envelope.data
         medications = normalized_medications(context)
         old_medications = {

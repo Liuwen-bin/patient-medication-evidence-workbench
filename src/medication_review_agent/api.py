@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import pickle
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -157,7 +157,19 @@ def create_app(
         app.state.checkpointer = saver
         app.state.graph = build_review_graph(dependencies, saver)
         try:
-            yield
+            async with AsyncExitStack() as gateway_stack:
+                opened_callers: set[int] = set()
+                for gateway in (dependencies.health, dependencies.drug):
+                    caller = getattr(gateway, "caller", None)
+                    if (
+                        caller is not None
+                        and id(caller) not in opened_callers
+                        and hasattr(caller, "__aenter__")
+                        and hasattr(caller, "__aexit__")
+                    ):
+                        await gateway_stack.enter_async_context(caller)
+                        opened_callers.add(id(caller))
+                yield
         finally:
             if owned_checkpointer:
                 await saver.conn.close()

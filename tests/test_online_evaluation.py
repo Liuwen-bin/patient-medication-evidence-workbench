@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -14,6 +15,7 @@ import pytest
 from medication_review_agent.online_evaluation import (
     OnlineCase,
     OnlineCaseResult,
+    OnlineEvaluationError,
     OnlineEvaluationRunner,
     OnlineMetrics,
     _run_all,
@@ -178,13 +180,57 @@ def test_online_case_manifest_has_five_stable_cases() -> None:
     assert all(case.expected.get("patientRef") for case in cases)
     assert all("productMappings" in case.expected for case in cases)
     assert all("missingFields" in case.expected for case in cases)
+    assert [case.expected["missingFields"] for case in cases] == [
+        [
+            "allergies",
+            "specialPopulations",
+            "activeMedications.medreq-DEMO-LIVE-001.strength",
+        ],
+        [
+            "allergies",
+            "specialPopulations",
+            "activeMedications.medreq-DEMO-LIVE-AMB.strength",
+        ],
+        [
+            "specialPopulations",
+            "activeMedications.medreq-DEMO-LIVE-ALLERGY.strength",
+        ],
+        [
+            "allergies",
+            "specialPopulations",
+            "activeMedications.medreq-DEMO-LIVE-POLY-1.strength",
+            "activeMedications.medreq-DEMO-LIVE-POLY-2.strength",
+            "activeMedications.medreq-DEMO-LIVE-POLY-2.route",
+        ],
+        [
+            "allergies",
+            "specialPopulations",
+            "activeMedications.medreq-DEMO-LIVE-DEG.strength",
+        ],
+    ]
     assert "INGREDIENT_ALLERGY_NAME_MATCH" in cases[2].findingDecisions
+    assert "EVIDENCE_GAP" in cases[2].findingDecisions
     assert "PRODUCT_UNMAPPED" in cases[3].findingDecisions
-    assert "LABEL_EVIDENCE_MISSING" in cases[4].findingDecisions
+    assert "LABEL_EVIDENCE_REVIEW" in cases[4].findingDecisions
     assert all(
         set(case.expected.get("findingTypes") or []) <= set(case.findingDecisions)
         for case in cases
     )
+
+
+def test_ambiguous_live_medication_uses_a_real_name_without_an_identifier() -> None:
+    resources = [
+        json.loads(line)
+        for line in Path("evaluation/live-health-resources.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    medication = next(
+        item for item in resources if item.get("id") == "medication-DEMO-LIVE-AMB"
+    )
+
+    assert medication["code"] == {"text": "ARNICA MONTANA"}
 
 
 @pytest.mark.asyncio
@@ -386,17 +432,24 @@ def test_live_launcher_enforces_isolation_and_secret_path_boundary() -> None:
     assert "Get-FileHash" in text
     assert "SOURCE_DATABASE_CHANGED" in text
     assert "MILVUS_URI" in text
+    assert "medication_review_agent.fault_proxy" in text
+    assert "medication_review_agent.dailymed_compat" in text
+    assert "Wait-TcpPortClosed" in text
+    assert "Stop-OwnedProcess" in text
     assert "8011" in text
     assert "8021" in text
     assert "--rag-unavailable-base-url" in text
     outer_finally = text.rsplit("finally {", 1)[1]
     assert "Get-FileHash -LiteralPath $sourceHealthDb" in outer_finally
     assert "SourceDatabaseIntegrityError" in outer_finally
-    assert outer_finally.index("Get-FileHash") > outer_finally.index("Stop-Process")
+    assert outer_finally.index("Get-FileHash") > outer_finally.index("Stop-OwnedProcess")
 
 
 @pytest.mark.parametrize("port", [8000, 8010, 8020, 8011, 8021])
 def test_live_launcher_rejects_an_owned_port_in_preview_mode(port: int) -> None:
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("PowerShell is required to exercise the Windows live launcher")
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if sys.platform == "win32":
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
@@ -405,7 +458,7 @@ def test_live_launcher_rejects_an_owned_port_in_preview_mode(port: int) -> None:
     try:
         completed = subprocess.run(
             [
-                "powershell",
+                powershell,
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",
@@ -692,36 +745,27 @@ def test_online_metrics_reject_citation_whose_ref_disagrees_with_document_id(
     assert metrics.acceptedCitationValidity == 0.0
 
 
-def test_degraded_case_requires_observed_rag_failure() -> None:
+def test_degraded_case_accepts_attested_graph_fallback_after_rag_failure() -> None:
     case = OnlineCase(
         caseId="online-evidence-degraded",
         patientId="DEMO-LIVE-DEG",
         question="核查标签警告正文",
         serviceProfile="rag-unavailable",
         expected={
-            "findingTypes": ["LABEL_EVIDENCE_MISSING"],
+            "findingTypes": ["LABEL_EVIDENCE_REVIEW"],
             "maximumNarrativeAttemptsPerScope": 2,
         },
     )
     snapshot = {
         "medicationMappings": [],
-        "findings": [{"reviewType": "LABEL_EVIDENCE_MISSING"}],
-        "unresolvedItems": [{
-            "sourceTool": "search_label_evidence",
-            "unresolvedReason": "INSUFFICIENT_EVIDENCE",
-        }],
+        "findings": [{"reviewType": "LABEL_EVIDENCE_REVIEW"}],
+        "unresolvedItems": [],
     }
     operational = {
         "narrativeAttempts": {"maximumPerScope": 1},
         "toolStatuses": {"search_label_evidence": {"OK": 1}},
     }
 
-    assert not case_expectations_met(
-        case, snapshot, operational, OnlineMetrics()
-    )
-    operational["toolStatuses"] = {
-        "search_label_evidence": {"INSUFFICIENT_EVIDENCE": 1}
-    }
     assert not case_expectations_met(
         case, snapshot, operational, OnlineMetrics()
     )
@@ -733,6 +777,31 @@ def test_degraded_case_requires_observed_rag_failure() -> None:
         "observedUnavailable": True,
     }
     assert case_expectations_met(case, snapshot, operational, OnlineMetrics())
+
+
+@pytest.mark.asyncio
+async def test_non_version_conflict_is_not_reported_as_stale_review() -> None:
+    async def conflict(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={"detail": "The signed review has no eligible writeback content."},
+        )
+
+    runner = OnlineEvaluationRunner(
+        base_url="http://review.test",
+        api_key="secret",
+        reviewer_id="pharmacist-eval",
+        transport=httpx.MockTransport(conflict),
+    )
+    async with httpx.AsyncClient(
+        base_url="http://review.test",
+        transport=runner.transport,
+    ) as client:
+        with pytest.raises(OnlineEvaluationError) as raised:
+            await runner._request(client, "POST", "/writeback/prepare", payload={})
+
+    assert raised.value.code == "REVIEW_API_ERROR"
+    assert "no eligible writeback content" in str(raised.value)
 
 
 def test_online_metrics_reject_partial_multi_product_citation_coverage(

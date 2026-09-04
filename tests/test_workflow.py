@@ -23,6 +23,7 @@ from medication_review_agent.repository import ReviewRepository
 from medication_review_agent.workflow import (
     _label_evidence_bindings,
     deidentified_patient_features,
+    relevant_missing_fields,
     state_to_snapshot,
 )
 
@@ -39,6 +40,16 @@ from tests.fakes import (
 
 MED1 = {"id": "med-1", "medication": "ARNICA", "identifiers": [{"system": "ndc", "code": "1"}], "strength": None, "dosage": None, "route": None, "evidenceRef": "FHIR:MedicationRequest/med-1"}
 MED2 = {"id": "med-2", "medication": "METFORMIN", "identifiers": [], "strength": None, "dosage": None, "route": None, "evidenceRef": "FHIR:MedicationRequest/med-2"}
+
+
+def test_missing_context_is_never_hidden_by_the_selected_review_topics() -> None:
+    missing = [
+        "allergies",
+        "specialPopulations",
+        "activeMedications.med-1.strength",
+    ]
+
+    assert relevant_missing_fields([ReviewTopic.IDENTITY], missing) == sorted(missing)
 
 
 class RecordingPlanner:
@@ -347,7 +358,7 @@ async def test_question_is_parsed_with_deidentified_context_and_metadata_survive
 
 
 @pytest.mark.asyncio
-async def test_plan_adds_only_topic_relevant_missing_field_findings(tmp_path: Path) -> None:
+async def test_plan_surfaces_missing_fields_outside_the_selected_topic(tmp_path: Path) -> None:
     planner = RecordingPlanner(planning_result(ReviewTopic.STORAGE, with_model_call=False))
     graph = build_test_graph(
         tmp_path,
@@ -366,7 +377,11 @@ async def test_plan_adds_only_topic_relevant_missing_field_findings(tmp_path: Pa
         config={"configurable": {"thread_id": "review-storage"}},
     )
 
-    assert not [item for item in state["findings"] if item.get("missingField")]
+    assert {
+        item["missingField"]
+        for item in state["findings"]
+        if item.get("missingField")
+    } == {"allergies", "activeMedications.med-1.route"}
     await graph.checkpointer.conn.close()
 
 
@@ -2221,6 +2236,183 @@ async def test_resolved_patient_context_gap_is_retired_after_refresh(tmp_path: P
     assert refreshed["stillMissing"] is False
     assert refreshed["status"] == "REJECTED"
     assert refreshed["summary"].startswith("Resolved:")
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_context_refresh_surfaces_a_newly_missing_patient_field(
+    tmp_path: Path,
+) -> None:
+    class SequencedHealthGateway:
+        def __init__(self) -> None:
+            self.responses = [
+                health_context(MED1, missing=["allergies"]),
+                health_context(
+                    MED1,
+                    missing=["allergies", "specialPopulations"],
+                ),
+            ]
+
+        async def get_review_context(self, patient_id: str | None, as_of: str | None):
+            del patient_id, as_of
+            return self.responses.pop(0)
+
+    graph = build_test_graph(
+        tmp_path,
+        SequencedHealthGateway(),
+        FakeDrugGateway(standard_drug_responses({"ARNICA": mapped_response()})),
+    )
+    config = {"configurable": {"thread_id": "review-1"}}
+    first = await graph.ainvoke({
+        "reviewId": "review-1",
+        "patientRef": "P001",
+        "asOf": "2026-08-31",
+    }, config=config)
+    allergy_gap = next(
+        item for item in first["findings"] if item.get("missingField") == "allergies"
+    )
+
+    refreshed = await graph.ainvoke(Command(resume={
+        "action": "COMPLETE_FINDING_REVIEW",
+        "reviewerId": "pharmacist-demo",
+        "decisions": [{
+            "action": "REQUEST_MORE_EVIDENCE",
+            "findingId": allergy_gap["findingId"],
+        }],
+    }), config=config)
+
+    new_gap = next(
+        item for item in refreshed["findings"]
+        if item.get("missingField") == "specialPopulations"
+    )
+    assert new_gap["reviewType"] == "EVIDENCE_GAP"
+    assert new_gap["status"] == "PENDING"
+    assert new_gap["requiresHumanReview"] is True
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_context_refresh_resolves_other_fields_updated_by_same_snapshot(
+    tmp_path: Path,
+) -> None:
+    class SequencedHealthGateway:
+        def __init__(self) -> None:
+            self.responses = [
+                health_context(
+                    MED1,
+                    missing=["allergies", "specialPopulations"],
+                ),
+                health_context(MED1, missing=["allergies"]),
+            ]
+
+        async def get_review_context(self, patient_id: str | None, as_of: str | None):
+            del patient_id, as_of
+            return self.responses.pop(0)
+
+    graph = build_test_graph(
+        tmp_path,
+        SequencedHealthGateway(),
+        FakeDrugGateway(standard_drug_responses({"ARNICA": mapped_response()})),
+    )
+    config = {"configurable": {"thread_id": "review-1"}}
+    first = await graph.ainvoke({
+        "reviewId": "review-1",
+        "patientRef": "P001",
+        "asOf": "2026-08-31",
+    }, config=config)
+    gaps = {
+        item["missingField"]: item for item in first["findings"]
+        if item.get("missingField")
+    }
+
+    refreshed = await graph.ainvoke(Command(resume={
+        "action": "COMPLETE_FINDING_REVIEW",
+        "reviewerId": "pharmacist-demo",
+        "decisions": [{
+            "action": "REQUEST_MORE_EVIDENCE",
+            "findingId": gaps["allergies"]["findingId"],
+        }],
+    }), config=config)
+
+    resolved = next(
+        item for item in refreshed["findings"]
+        if item.get("missingField") == "specialPopulations"
+    )
+    assert resolved["status"] == "REJECTED"
+    assert resolved["stillMissing"] is False
+    assert resolved["resolution"] == "RESOLVED_BY_CONTEXT_REFRESH"
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_context_refresh_reopens_a_resolved_field_that_is_missing_again(
+    tmp_path: Path,
+) -> None:
+    class SequencedHealthGateway:
+        def __init__(self) -> None:
+            self.responses = [
+                health_context(
+                    MED1,
+                    missing=["allergies", "specialPopulations"],
+                ),
+                health_context(MED1, missing=["allergies"]),
+                health_context(
+                    MED1,
+                    missing=["allergies", "specialPopulations"],
+                ),
+            ]
+
+        async def get_review_context(self, patient_id: str | None, as_of: str | None):
+            del patient_id, as_of
+            return self.responses.pop(0)
+
+    graph = build_test_graph(
+        tmp_path,
+        SequencedHealthGateway(),
+        FakeDrugGateway(standard_drug_responses({"ARNICA": mapped_response()})),
+    )
+    config = {"configurable": {"thread_id": "review-1"}}
+    first = await graph.ainvoke({
+        "reviewId": "review-1",
+        "patientRef": "P001",
+        "asOf": "2026-08-31",
+    }, config=config)
+    gaps = {
+        item["missingField"]: item for item in first["findings"]
+        if item.get("missingField")
+    }
+
+    resolved = await graph.ainvoke(Command(resume={
+        "action": "COMPLETE_FINDING_REVIEW",
+        "reviewerId": "pharmacist-demo",
+        "decisions": [{
+            "action": "REQUEST_MORE_EVIDENCE",
+            "findingId": gaps["specialPopulations"]["findingId"],
+        }],
+    }), config=config)
+    resolved_special = next(
+        item for item in resolved["findings"]
+        if item.get("missingField") == "specialPopulations"
+    )
+    assert resolved_special["status"] == "REJECTED"
+    assert resolved_special["stillMissing"] is False
+
+    refreshed = await graph.ainvoke(Command(resume={
+        "action": "COMPLETE_FINDING_REVIEW",
+        "reviewerId": "pharmacist-demo",
+        "decisions": [{
+            "action": "REQUEST_MORE_EVIDENCE",
+            "findingId": gaps["allergies"]["findingId"],
+        }],
+    }), config=config)
+
+    reopened = next(
+        item for item in refreshed["findings"]
+        if item.get("missingField") == "specialPopulations"
+    )
+    assert reopened["status"] == "PENDING"
+    assert reopened["stillMissing"] is True
+    assert "resolution" not in reopened
     await graph.checkpointer.conn.close()
 
 

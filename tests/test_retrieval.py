@@ -173,6 +173,25 @@ async def test_evidence_id_is_stable_for_identity_and_changes_with_version() -> 
 
 
 @pytest.mark.asyncio
+async def test_same_label_reference_keeps_distinct_topic_evidence_ids() -> None:
+    ingredients = evidence_item(topic="ingredients")
+    warnings = evidence_item(topic="warnings")
+    warnings["evidenceRef"] = ingredients["evidenceRef"]
+    warnings["sectionId"] = ingredients["sectionId"]
+
+    outcome = await BoundedEvidenceRetriever(
+        FakeSearchGateway([tool_result("OK", [ingredients, warnings])]),
+        grader=None,
+    ).retrieve(scoped_request(topics=(
+        ReviewTopic.INGREDIENTS,
+        ReviewTopic.WARNINGS,
+    )))
+
+    assert outcome.unresolvedReason is None
+    assert len({item.evidenceId for item in outcome.results}) == 2
+
+
+@pytest.mark.asyncio
 async def test_retriever_rejects_cross_product_evidence_before_grader() -> None:
     gateway = FakeSearchGateway([
         tool_result("OK", [evidence_item(product_id="DRUG_PRODUCT::B")]),

@@ -1,4 +1,9 @@
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
 import pytest
+
+from medication_review_agent import gateways as gateways_module
 
 from medication_review_agent.gateways import (
     DrugEvidenceGateway,
@@ -112,3 +117,107 @@ def test_streamable_http_rejects_remote_plain_http_by_default() -> None:
 def test_streamable_http_allows_loopback_plain_http() -> None:
     caller = StreamableHTTPMCPCaller("http://127.0.0.1:8000/mcp", allow_remote=False)
     assert caller.url.endswith("/mcp")
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_reuses_one_session_across_tool_calls(monkeypatch) -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def fake_transport(url: str):
+        events.append(f"transport-enter:{url}")
+        try:
+            yield "read", "write", lambda: "session-1"
+        finally:
+            events.append("transport-exit")
+
+    class FakeClientSession:
+        def __init__(self, read_stream: str, write_stream: str) -> None:
+            assert (read_stream, write_stream) == ("read", "write")
+
+        async def __aenter__(self):
+            events.append("session-enter")
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            events.append("session-exit")
+
+        async def initialize(self) -> None:
+            events.append("initialize")
+
+        async def call_tool(self, name: str, arguments: dict):
+            events.append(f"call:{name}:{arguments['value']}")
+            return SimpleNamespace(
+                structuredContent={"name": name, "value": arguments["value"]},
+                content=[],
+            )
+
+    monkeypatch.setattr(gateways_module, "streamablehttp_client", fake_transport)
+    monkeypatch.setattr(gateways_module, "ClientSession", FakeClientSession)
+    caller = StreamableHTTPMCPCaller("http://127.0.0.1:8010/mcp")
+
+    async with caller:
+        first = await caller.call_tool("first", {"value": 1})
+        second = await caller.call_tool("second", {"value": 2})
+
+    assert first == {"name": "first", "value": 1}
+    assert second == {"name": "second", "value": 2}
+    assert events == [
+        "transport-enter:http://127.0.0.1:8010/mcp",
+        "session-enter",
+        "initialize",
+        "call:first:1",
+        "call:second:2",
+        "session-exit",
+        "transport-exit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_reconnects_after_transport_failure(monkeypatch) -> None:
+    generations = 0
+    closed: list[int] = []
+
+    @asynccontextmanager
+    async def fake_transport(_url: str):
+        nonlocal generations
+        generations += 1
+        generation = generations
+        try:
+            yield generation, generation, None
+        finally:
+            closed.append(generation)
+
+    class FakeClientSession:
+        def __init__(self, read_stream: int, write_stream: int) -> None:
+            assert read_stream == write_stream
+            self.generation = read_stream
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            return None
+
+        async def call_tool(self, _name: str, _arguments: dict):
+            if self.generation == 1:
+                raise ConnectionError("stream closed")
+            return SimpleNamespace(
+                structuredContent={"generation": self.generation}, content=[]
+            )
+
+    monkeypatch.setattr(gateways_module, "streamablehttp_client", fake_transport)
+    monkeypatch.setattr(gateways_module, "ClientSession", FakeClientSession)
+    caller = StreamableHTTPMCPCaller("http://127.0.0.1:8010/mcp")
+
+    async with caller:
+        with pytest.raises(ConnectionError, match="stream closed"):
+            await caller.call_tool("first", {})
+        result = await caller.call_tool("second", {})
+
+    assert result == {"generation": 2}
+    assert generations == 2
+    assert closed == [1, 2]
