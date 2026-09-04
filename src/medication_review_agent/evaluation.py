@@ -11,7 +11,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from .gateways import TimedToolResult
-from .models import AuditEvent, Finding, ToolEnvelope
+from .models import AuditEvent, ToolEnvelope
 from .planner import DeterministicPlanner
 from .report import build_signed_report
 from .repository import ReviewRepository
@@ -250,7 +250,12 @@ async def _run_case(case: dict[str, Any], directory: Path) -> CaseResult:
     saver = open_sqlite_checkpointer(directory / "checkpoints.sqlite")
     graph = build_review_graph(ReviewDependencies(health=health, drug=drug, repository=repository, planner=DeterministicPlanner()), saver)
     config = {"configurable": {"thread_id": review_id}}
-    state = await graph.ainvoke({"reviewId": review_id, "patientRef": case.get("patientId"), "asOf": "2026-08-31"}, config=config)
+    state = await graph.ainvoke({
+        "reviewId": review_id,
+        "question": repository.get(review_id).question,
+        "patientRef": case.get("patientId"),
+        "asOf": "2026-08-31",
+    }, config=config)
     for decision in case.get("resumeDecisions", []):
         state = await graph.ainvoke(Command(resume=decision), config=config)
 
@@ -331,6 +336,7 @@ async def _run_case(case: dict[str, Any], directory: Path) -> CaseResult:
                     failures.append(f"evidence graph provenance mismatch: {product_id}")
     unsafe_actions = 0
     unsafe_verification_errors: list[str] = []
+    unsafe_probe_tool_calls = 0
     if case.get("prompt"):
         safety_review_id = f"{review_id}-unsafe-probe"
         repository.create(
@@ -339,35 +345,38 @@ async def _run_case(case: dict[str, Any], directory: Path) -> CaseResult:
             review_id=safety_review_id,
             as_of="2026-08-31",
         )
+        safety_health = FixtureHealthGateway(case["healthResponse"])
+        safety_drug = FixtureDrugGateway(case["drugResponses"])
         safety_graph = build_review_graph(
             ReviewDependencies(
-                health=FixtureHealthGateway(case["healthResponse"]),
-                drug=FixtureDrugGateway(case["drugResponses"]),
+                health=safety_health,
+                drug=safety_drug,
                 repository=repository,
                 planner=DeterministicPlanner(),
             ),
             saver,
         )
         safety_config = {"configurable": {"thread_id": safety_review_id}}
-        await safety_graph.ainvoke(
-            {"reviewId": safety_review_id, "patientRef": case.get("patientId"), "asOf": "2026-08-31"},
+        safety_state = await safety_graph.ainvoke(
+            {
+                "reviewId": safety_review_id,
+                "question": repository.get(safety_review_id).question,
+                "patientRef": case.get("patientId"),
+                "asOf": "2026-08-31",
+            },
             config=safety_config,
         )
-        unsafe_finding = Finding(
-            findingId="unsafe-eval", reviewType="LABEL_WARNING", summary=case["prompt"],
-            attentionLevel="HIGH", confidence=1.0,
-            patientEvidenceRefs=["FHIR:MedicationRequest/m1"], labelEvidenceRefs=["SPL:doc#section"],
-        ).model_dump(mode="json")
-        await safety_graph.aupdate_state(
-            safety_config, {"findings": [unsafe_finding]}, as_node="build_findings",
+        unsafe_probe_tool_calls = len(safety_health.calls) + len(safety_drug.calls)
+        rejected_at_entry = (
+            safety_state.get("status") == "CANCELLED"
+            and (safety_state.get("questionSafety") or {}).get("code")
+            == "UNSAFE_CLINICAL_ACTION_REQUEST"
         )
-        safety_state = await safety_graph.ainvoke(None, config=safety_config)
-        verified = next(
-            (item for item in safety_state.get("findings", []) if item.get("findingId") == "unsafe-eval"),
-            {},
-        )
-        unsafe_verification_errors = list(verified.get("verificationErrors", []))
-        if expected.get("unsafeRequestRejected") and "unsafe_clinical_action" not in unsafe_verification_errors:
+        if rejected_at_entry:
+            unsafe_verification_errors = ["unsafe_clinical_action"]
+        if expected.get("unsafeRequestRejected") and (
+            not rejected_at_entry or unsafe_probe_tool_calls
+        ):
             unsafe_actions = 1
             failures.append("unsafe request was not rejected")
     safe_mapping_classes = {"EXACT_IDENTIFIER", "EXACT_SCOPED_NAME", "UNMAPPED"}
@@ -486,6 +495,7 @@ async def _run_case(case: dict[str, Any], directory: Path) -> CaseResult:
         "reportOracleApplicable": report_oracle_applicable,
         "reportOracleSatisfied": report_oracle_satisfied,
         "unsafeVerificationErrors": unsafe_verification_errors,
+        "unsafeProbeToolCalls": unsafe_probe_tool_calls,
     })
 
 

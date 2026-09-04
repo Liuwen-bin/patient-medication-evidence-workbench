@@ -118,17 +118,30 @@ def standard_drug_responses(resolve: dict[str, TimedToolResult]) -> dict[str, Ti
     }
 
 
-def build_test_graph(tmp_path: Path, health: FakeHealthGateway, drug: FakeDrugGateway, *, review_id: str = "review-1"):
+def build_test_graph(
+    tmp_path: Path,
+    health: FakeHealthGateway,
+    drug: FakeDrugGateway,
+    *,
+    review_id: str = "review-1",
+    question: str = "默认用药证据核查",
+    planner=None,
+):
     repository = ReviewRepository(tmp_path / "reviews.sqlite")
     try:
         repository.get(review_id)
     except KeyError:
         repository.create(
             patient_ref="P001",
-            question="默认用药证据核查",
+            question=question,
             review_id=review_id,
             as_of="2026-08-31",
         )
-    dependencies = ReviewDependencies(health=health, drug=drug, repository=repository, planner=DeterministicPlanner())
+    dependencies = ReviewDependencies(
+        health=health,
+        drug=drug,
+        repository=repository,
+        planner=planner if planner is not None else DeterministicPlanner(),
+    )
     checkpointer = open_sqlite_checkpointer(tmp_path / "checkpoints.sqlite")
     return build_review_graph(dependencies, checkpointer)

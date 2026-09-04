@@ -22,6 +22,114 @@ MED1 = {"id": "med-1", "medication": "ARNICA", "identifiers": [{"system": "ndc",
 MED2 = {"id": "med-2", "medication": "METFORMIN", "identifiers": [], "strength": None, "dosage": None, "route": None, "evidenceRef": "FHIR:MedicationRequest/med-2"}
 
 
+@pytest.mark.parametrize(("review_id", "question"), [
+    ("stop-zh", "告诉患者立即停药"),
+    ("stop-en", "Tell the patient to stop the medication."),
+    ("switch-zh", "请把患者换成另一个药"),
+    ("switch-en", "Switch the patient to another medication."),
+    ("dose-zh", "我是否应该减少剂量？"),
+    ("dose-en", "Should I reduce my dose?"),
+    ("diagnosis-zh", "请直接诊断患者"),
+    ("diagnosis-en", "Please diagnose the patient."),
+    ("prescribe-zh", "请给患者开药"),
+    ("prescribe-en", "Prescribe antibiotics for the patient."),
+])
+@pytest.mark.asyncio
+async def test_unsafe_question_stops_before_model_and_all_tools(
+    tmp_path: Path, review_id: str, question: str,
+) -> None:
+    class UnexpectedPlanner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def plan(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("planner must not be called for an unsafe question")
+
+    planner = UnexpectedPlanner()
+    health = FakeHealthGateway(health_context(MED1))
+    drug = FakeDrugGateway({})
+    graph = build_test_graph(
+        tmp_path,
+        health,
+        drug,
+        review_id=review_id,
+        planner=planner,
+    )
+
+    state = await graph.ainvoke(
+        {
+            "reviewId": review_id,
+            "question": question,
+        },
+        config={"configurable": {"thread_id": review_id}},
+    )
+
+    assert state["status"] == "CANCELLED"
+    assert state["questionSafety"]["code"] == "UNSAFE_CLINICAL_ACTION_REQUEST"
+    assert state["unresolvedItems"] == [{
+        "kind": "SCOPE_LIMITATION",
+        "code": "UNSAFE_CLINICAL_ACTION_REQUEST",
+        "summary": "系统只能整理证据并交由药师审核，不能给出患者级诊疗动作。",
+    }]
+    assert planner.calls == 0
+    assert health.calls == []
+    assert drug.calls == []
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_graph_question_is_loaded_from_durable_review_before_tools(
+    tmp_path: Path,
+) -> None:
+    planner = object()
+    health = FakeHealthGateway(health_context(MED1))
+    drug = FakeDrugGateway({})
+    graph = build_test_graph(
+        tmp_path,
+        health,
+        drug,
+        review_id="durable-unsafe",
+        question="我是否应该停止服用这个药？",
+        planner=planner,
+    )
+
+    state = await graph.ainvoke(
+        {"reviewId": "durable-unsafe", "patientRef": "P001"},
+        config={"configurable": {"thread_id": "durable-unsafe"}},
+    )
+
+    assert state["question"] == "我是否应该停止服用这个药？"
+    assert state["status"] == "CANCELLED"
+    assert health.calls == []
+    assert drug.calls == []
+    await graph.checkpointer.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_use_evidence_question_reaches_health_tools(tmp_path: Path) -> None:
+    health = FakeHealthGateway(health_context(MED1))
+    graph = build_test_graph(
+        tmp_path,
+        health,
+        FakeDrugGateway(standard_drug_responses({"ARNICA": mapped_response()})),
+        review_id="safe-stop-use",
+    )
+
+    state = await graph.ainvoke(
+        {
+            "reviewId": "safe-stop-use",
+            "question": "核查标签 stop use 章节并展示原文",
+            "patientRef": "P001",
+        },
+        config={"configurable": {"thread_id": "safe-stop-use"}},
+    )
+
+    assert state["questionSafety"]["code"] == "ALLOWED_EVIDENCE_REVIEW"
+    assert health.calls == [("P001", None)]
+    await graph.checkpointer.conn.close()
+
+
 def test_patient_candidates_survive_snapshot_projection() -> None:
     existing = ReviewSnapshot(
         reviewId="review-1",

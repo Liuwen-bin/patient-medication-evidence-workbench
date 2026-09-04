@@ -21,6 +21,7 @@ from .models import (
 )
 from .planner import ReviewPlanner
 from .repository import ReviewRepository
+from .safety import evaluate_review_question
 from .verifier import apply_verification
 
 
@@ -30,6 +31,7 @@ class ReviewState(TypedDict, total=False):
     schemaVersion: str
     status: str
     question: str
+    questionSafety: dict[str, Any]
     patientRef: str | None
     asOf: str | None
     contextSnapshot: dict[str, Any]
@@ -133,6 +135,30 @@ async def _retry(operation):
 
 
 def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqliteSaver):
+    def safety_gate(state: ReviewState) -> dict[str, Any]:
+        question = state.get("question")
+        if not isinstance(question, str) or not question.strip():
+            try:
+                question = dependencies.repository.get(state["reviewId"]).question
+            except (KeyError, TypeError):
+                question = ""
+        decision = evaluate_review_question(question)
+        return {
+            "question": question,
+            "questionSafety": decision.model_dump(mode="json"),
+        }
+
+    def explain_scope(state: ReviewState) -> dict[str, Any]:
+        decision = state["questionSafety"]
+        return {
+            "status": ReviewStatus.CANCELLED.value,
+            "unresolvedItems": [{
+                "kind": "SCOPE_LIMITATION",
+                "code": decision["code"],
+                "summary": decision["explanation"],
+            }],
+        }
+
     async def audited_call(
         state: ReviewState, node: str, tool: str, summary: dict[str, Any], operation,
         *, audit_slot: str | None = None,
@@ -1026,6 +1052,8 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
         return {"humanDecisions": [*(state.get("humanDecisions") or []), human.model_dump(mode="json")], "status": ReviewStatus.SIGNED_OFF.value}
 
     graph = StateGraph(ReviewState)
+    graph.add_node("safety_gate", safety_gate)
+    graph.add_node("explain_scope", explain_scope)
     graph.add_node("collect_review_context", collect_review_context)
     graph.add_node("select_patient", select_patient)
     graph.add_node("validate_context", validate_context)
@@ -1041,7 +1069,13 @@ def build_review_graph(dependencies: ReviewDependencies, checkpointer: AsyncSqli
     graph.add_node("verify_findings", verify_findings_node)
     graph.add_node("pharmacist_review", pharmacist_review)
     graph.add_node("render_report", render_report)
-    graph.add_edge(START, "collect_review_context")
+    graph.add_edge(START, "safety_gate")
+    graph.add_conditional_edges(
+        "safety_gate",
+        lambda state: "collect" if state["questionSafety"]["allowed"] else "explain",
+        {"collect": "collect_review_context", "explain": "explain_scope"},
+    )
+    graph.add_edge("explain_scope", END)
     graph.add_conditional_edges("collect_review_context", lambda state: "end" if state["status"] == ReviewStatus.BLOCKED_TOOL_ERROR.value else "select" if state["status"] == ReviewStatus.AWAITING_PATIENT_CONFIRMATION.value else "validate", {"end": END, "select": "select_patient", "validate": "validate_context"})
     graph.add_edge("select_patient", "collect_review_context")
     graph.add_edge("validate_context", "normalize_medications")

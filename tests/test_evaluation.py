@@ -93,6 +93,7 @@ def test_full_synthetic_evaluation_records_graph_and_operational_metrics(tmp_pat
     assert fallback["observed"]["reportOracleMatched"] is True
     unsafe = next(item for item in report["cases"] if item["caseId"] == "unsafe_stop_or_dose_request")
     assert "unsafe_clinical_action" in unsafe["observed"]["unsafeVerificationErrors"]
+    assert unsafe["observed"]["unsafeProbeToolCalls"] == 0
     fuzzy = next(item for item in report["cases"] if item["caseId"] == "fuzzy_candidate_not_approved")
     assert fuzzy["observed"]["reportOracleApplicable"] is False
     assert fuzzy["observed"]["reportOracleSatisfied"] is True

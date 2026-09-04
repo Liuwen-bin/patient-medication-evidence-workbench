@@ -10,7 +10,7 @@ from medication_review_agent.planner import DeterministicPlanner
 from medication_review_agent.models import ReviewStatus
 from medication_review_agent.repository import ReviewRepository
 from medication_review_agent.workflow import ReviewDependencies
-from tests.fakes import FakeDrugGateway, FakeHealthGateway, health_context, mapped_response, standard_drug_responses
+from tests.fakes import FakeDrugGateway, FakeHealthGateway, envelope, health_context, mapped_response, standard_drug_responses
 from tests.test_workflow import MED1
 
 
@@ -179,6 +179,178 @@ def test_cancel_requires_observed_version_and_persists_cancelled_enum(client: Te
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "CANCELLED"
     assert client.post(f"/api/reviews/{review_id}/cancel", json={"expectedVersion": 0}).status_code == 409
+
+
+def test_legacy_resume_rechecks_durable_question_and_cancels_before_tools(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_API_KEY", "test-secret")
+    monkeypatch.setenv("REVIEW_API_REVIEWER_ID", "pharmacist-demo")
+    repository = ReviewRepository(tmp_path / "reviews.sqlite")
+    review = repository.create(
+        patient_ref="P001",
+        question="Tell the patient to stop the medication.",
+        review_id="legacy-unsafe",
+    )
+    review.status = ReviewStatus.AWAITING_MAPPING_CONFIRMATION
+    review.medicationMappings = []
+    review = repository.save(review, expected_version=0)
+    health = FakeHealthGateway(health_context(MED1))
+    drug = FakeDrugGateway({})
+    dependencies = ReviewDependencies(
+        health=health,
+        drug=drug,
+        repository=repository,
+        planner=DeterministicPlanner(),
+    )
+    app = create_app(dependencies, checkpoint_path=tmp_path / "checkpoints.sqlite")
+
+    with TestClient(app) as isolated:
+        isolated.headers.update({
+            "x-api-key": "test-secret",
+            "x-reviewer-id": "pharmacist-demo",
+        })
+        response = isolated.post("/api/reviews/legacy-unsafe/decisions", json={
+            "expectedVersion": review.version,
+            "action": "CONFIRM_MAPPING",
+            "medicationId": "med-1",
+            "productId": "DRUG_PRODUCT::1",
+            "reviewerId": "pharmacist-demo",
+        })
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+    assert response.json()["unresolvedItems"] == [{
+        "kind": "SCOPE_LIMITATION",
+        "code": "UNSAFE_CLINICAL_ACTION_REQUEST",
+        "summary": "系统只能整理证据并交由药师审核，不能给出患者级诊疗动作。",
+    }]
+    assert health.calls == []
+    assert drug.calls == []
+
+
+def test_unsafe_resume_recovers_checkpoint_advanced_mutation_before_cancelling(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_API_KEY", "test-secret")
+    monkeypatch.setenv("REVIEW_API_REVIEWER_ID", "pharmacist-demo")
+    repository = ReviewRepository(tmp_path / "reviews.sqlite")
+    review = repository.create(
+        patient_ref="P001",
+        question="我该停药吗",
+        review_id="recover-before-safety",
+    )
+    review.status = ReviewStatus.AWAITING_FINDING_REVIEW
+    review = repository.save(review, expected_version=0)
+    projected = review.model_copy(deep=True)
+    projected.status = ReviewStatus.READY_FOR_SIGN_OFF
+    repository.prepare_mutation(
+        mutation_id="pending-before-safety",
+        review_id=review.reviewId,
+        expected_version=review.version,
+        action_fingerprint="f" * 64,
+        checkpoint_backup=__import__("base64").b64encode(
+            __import__("pickle").dumps({"checkpoints": [], "writes": []}),
+        ),
+    )
+    repository.mark_checkpoint_advanced("pending-before-safety", projected)
+    dependencies = ReviewDependencies(
+        health=FakeHealthGateway(health_context(MED1)),
+        drug=FakeDrugGateway({}),
+        repository=repository,
+        planner=DeterministicPlanner(),
+    )
+    app = create_app(dependencies, checkpoint_path=tmp_path / "checkpoints.sqlite")
+
+    with TestClient(app) as isolated:
+        isolated.headers.update({
+            "x-api-key": "test-secret",
+            "x-reviewer-id": "pharmacist-demo",
+        })
+        response = isolated.post(f"/api/reviews/{review.reviewId}/decisions", json={
+            "expectedVersion": review.version,
+            "action": "SIGN_OFF",
+            "reviewerId": "pharmacist-demo",
+        })
+
+    assert response.status_code == 409
+    durable = repository.get(review.reviewId)
+    assert durable.version == 2
+    assert durable.status == ReviewStatus.READY_FOR_SIGN_OFF
+    assert repository.get_mutation("pending-before-safety")["state"] == "COMMITTED"
+
+
+def test_allowed_legacy_resume_injects_durable_question_and_safety_state(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    class RecordingPlanner:
+        def __init__(self) -> None:
+            self.question = None
+
+        async def plan(self, question, patient_features, mappings, missing_fields):
+            self.question = question
+            return await DeterministicPlanner().plan(
+                question, patient_features, mappings, missing_fields,
+            )
+
+    monkeypatch.setenv("REVIEW_API_KEY", "test-secret")
+    monkeypatch.setenv("REVIEW_API_REVIEWER_ID", "pharmacist-demo")
+    question = "核查活动用药医嘱与标签证据"
+    repository = ReviewRepository(tmp_path / "reviews.sqlite")
+    review = repository.create(
+        patient_ref="P001", question=question, review_id="legacy-allowed",
+    )
+    ambiguous = envelope("AMBIGUOUS", {
+        "matchClass": "AMBIGUOUS_NAME",
+        "selectedProductId": None,
+        "candidates": [{"productId": "DRUG_PRODUCT::1"}],
+        "unmatchedFields": [],
+    }, provenance={
+        "graphBackend": "neo4j",
+        "fallbackUsed": False,
+        "consistency": {"status": "CONSISTENT"},
+    })
+    planner = RecordingPlanner()
+    dependencies = ReviewDependencies(
+        health=FakeHealthGateway(health_context(MED1)),
+        drug=FakeDrugGateway(standard_drug_responses({"ARNICA": ambiguous})),
+        repository=repository,
+        planner=planner,
+    )
+    app = create_app(dependencies, checkpoint_path=tmp_path / "checkpoints.sqlite")
+    config = {"configurable": {"thread_id": review.reviewId}}
+
+    with TestClient(app) as isolated:
+        isolated.headers.update({
+            "x-api-key": "test-secret",
+            "x-reviewer-id": "pharmacist-demo",
+        })
+        running = isolated.post(f"/api/reviews/{review.reviewId}/run").json()
+        assert running["status"] == "AWAITING_MAPPING_CONFIRMATION"
+
+        async def erase_new_gate_fields() -> None:
+            await app.state.graph.aupdate_state(
+                config, {"question": None, "questionSafety": None},
+            )
+
+        isolated.portal.call(erase_new_gate_fields)
+        response = isolated.post(f"/api/reviews/{review.reviewId}/decisions", json={
+            "expectedVersion": running["version"],
+            "action": "CONFIRM_MAPPING",
+            "medicationId": "med-1",
+            "productId": "DRUG_PRODUCT::1",
+            "reviewerId": "pharmacist-demo",
+        })
+
+        async def read_graph_values():
+            return (await app.state.graph.aget_state(config)).values
+
+        values = isolated.portal.call(read_graph_values)
+
+    assert response.status_code == 200
+    assert planner.question == question
+    assert values["question"] == question
+    assert values["questionSafety"]["code"] == "ALLOWED_EVIDENCE_REVIEW"
 
 
 def test_repository_save_failure_restores_checkpoint_for_safe_retry(tmp_path: Path, monkeypatch) -> None:

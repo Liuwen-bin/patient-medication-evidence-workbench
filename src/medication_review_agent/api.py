@@ -23,6 +23,7 @@ from .planner import build_planner_from_env
 from .models import AuditEvent, ReviewStatus
 from .report import ReportNotSigned, build_signed_report, render_report_html, render_report_json
 from .repository import ReviewNotFound, ReviewRepository, ReviewVersionConflict
+from .safety import QuestionSafetyDecision, evaluate_review_question
 from .workflow import ReviewDependencies, build_review_graph, open_sqlite_checkpointer, state_to_snapshot
 
 
@@ -168,6 +169,21 @@ def create_app(
         projected = state_to_snapshot(existing, graph_state)
         try:
             return dependencies.repository.save(projected, expected_version=expected_version)
+        except ReviewVersionConflict as exc:
+            raise HTTPException(409, "Review version conflict") from exc
+
+    def cancel_unsafe_resume(snapshot, decision: QuestionSafetyDecision):
+        cancelled = snapshot.model_copy(deep=True)
+        cancelled.status = ReviewStatus.CANCELLED
+        cancelled.unresolvedItems = [{
+            "kind": "SCOPE_LIMITATION",
+            "code": decision.code,
+            "summary": decision.explanation,
+        }]
+        try:
+            return dependencies.repository.save(
+                cancelled, expected_version=snapshot.version,
+            )
         except ReviewVersionConflict as exc:
             raise HTTPException(409, "Review version conflict") from exc
 
@@ -335,6 +351,20 @@ def create_app(
             raise HTTPException(403, "Reviewer identity header does not match decision")
         lock = await review_lock(review_id)
         async with lock:
+            try:
+                payload = _decision_payload(body)
+            except (ValueError, TypeError) as exc:
+                raise HTTPException(422, str(exc)) from exc
+            mutation_id, _ = mutation_identity(
+                review_id, body.expectedVersion, payload,
+            )
+            owned_before_recovery = dependencies.repository.get_mutation(mutation_id)
+            await recover_pending(review_id)
+            if (
+                owned_before_recovery
+                and owned_before_recovery["state"] == "CHECKPOINT_ADVANCED"
+            ):
+                return get_review(review_id)
             snapshot = get_review(review_id)
             if snapshot.version != body.expectedVersion:
                 raise HTTPException(409, "Review version conflict")
@@ -343,12 +373,17 @@ def create_app(
                 "AWAITING_FINDING_REVIEW", "NEEDS_MORE_EVIDENCE", "READY_FOR_SIGN_OFF",
             }:
                 raise HTTPException(409, "Review is not awaiting a decision")
+            question_safety = evaluate_review_question(snapshot.question)
+            if not question_safety.allowed:
+                return cancel_unsafe_resume(snapshot, question_safety)
             try:
-                payload = _decision_payload(body)
-                mutation_id, _ = mutation_identity(review_id, body.expectedVersion, payload)
                 return await mutate(
                     review_id, expected_version=body.expectedVersion, payload=payload,
-                    command=Command(resume=payload, update={"mutationId": mutation_id}),
+                    command=Command(resume=payload, update={
+                        "mutationId": mutation_id,
+                        "question": snapshot.question,
+                        "questionSafety": question_safety.model_dump(mode="json"),
+                    }),
                 )
             except (ValueError, TypeError) as exc:
                 raise HTTPException(422, str(exc)) from exc
