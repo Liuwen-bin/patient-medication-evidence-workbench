@@ -94,6 +94,51 @@ def online_acceptance(metrics: OnlineMetrics) -> bool:
     )
 
 
+def case_expectations_met(
+    case: OnlineCase,
+    snapshot: dict[str, Any],
+    operational: dict[str, Any],
+    metrics: OnlineMetrics,
+) -> bool:
+    expected = case.expected
+    mappings = snapshot.get("medicationMappings") or []
+    mapped = [
+        item
+        for item in mappings
+        if item.get("selectedProductId") and item.get("matchClass") != "UNMAPPED"
+    ]
+    unmapped = [item for item in mappings if item.get("matchClass") == "UNMAPPED"]
+    observed_types = {
+        str(item.get("reviewType")) for item in snapshot.get("findings") or []
+    }
+    checks = [
+        len(mapped) >= int(expected.get("minimumMapped", 0)),
+        len(unmapped) >= int(expected.get("minimumUnmapped", 0)),
+        set(expected.get("findingTypes") or []) <= observed_types,
+    ]
+    if "mappingInterrupts" in expected:
+        checks.append(
+            operational.get("mappingInterrupts") == int(expected["mappingInterrupts"])
+        )
+    if "autoApprovedAmbiguous" in expected:
+        checks.append(
+            metrics.autoApprovedAmbiguous == int(expected["autoApprovedAmbiguous"])
+        )
+    if "acceptedCitationValidity" in expected:
+        checks.append(
+            metrics.acceptedCitationValidity
+            == float(expected["acceptedCitationValidity"])
+        )
+    if "maximumNarrativeAttemptsPerScope" in expected:
+        checks.append(
+            int((operational.get("narrativeAttempts") or {}).get("maximumPerScope", 0))
+            <= int(expected["maximumNarrativeAttemptsPerScope"])
+        )
+    if expected.get("requiresWritebackPreview"):
+        checks.append(int(operational.get("writebackPreviewCount", 0)) > 0)
+    return all(checks)
+
+
 class OnlineEvaluationRunner:
     def __init__(
         self,
@@ -103,12 +148,17 @@ class OnlineEvaluationRunner:
         reviewer_id: str,
         transport: httpx.AsyncBaseTransport | None = None,
         commit_synthetic: bool = False,
+        profile_base_urls: dict[str, str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.reviewer_id = reviewer_id
         self.transport = transport
         self.commit_synthetic = commit_synthetic
+        self.profile_base_urls = {
+            name: value.rstrip("/")
+            for name, value in (profile_base_urls or {}).items()
+        }
 
     async def _request(
         self,
@@ -216,6 +266,13 @@ class OnlineEvaluationRunner:
         mappings = snapshot.get("medicationMappings") or []
         exact = [item for item in mappings if item.get("matchClass") == "EXACT_IDENTIFIER"]
         exact_correct = [item for item in exact if item.get("selectedProductId")]
+        auto_approved_ambiguous = sum(
+            1
+            for item in mappings
+            if item.get("selectedProductId")
+            and item.get("matchClass")
+            in {"AMBIGUOUS", "FUZZY_NAME", "FUZZY_CANDIDATE"}
+        )
         model_calls = snapshot.get("modelCalls") or []
         model = model_calls[-1] if model_calls else {}
         state_metrics = snapshot.get("metrics") or {}
@@ -243,6 +300,10 @@ class OnlineEvaluationRunner:
             key = str(result_status)
             statuses[key] = statuses.get(key, 0) + 1
         resources = ((snapshot.get("writebackJob") or {}).get("resources") or [])
+        narrative_attempts = {
+            "maximumPerScope": max(retrieval_attempts.values(), default=0),
+            "total": sum(retrieval_attempts.values()),
+        }
         required = {
             "toolLatencyMs": state_metrics.get("toolLatencyMs"),
             "retries": state_metrics.get("retries"),
@@ -253,22 +314,33 @@ class OnlineEvaluationRunner:
             "promptVersion": model.get("promptVersion"),
             "modelFallback": model.get("fallback"),
         }
-        missing = sorted(key for key, value in required.items() if value is None)
-        coverage = (len(required) - len(missing)) / len(required)
+        coverage_fields = {
+            **required,
+            "perNodeAudit": per_node if per_node else None,
+            "narrativeAttempts": (
+                narrative_attempts if "retrievalAttempts" in snapshot else None
+            ),
+            "mappingInterrupts": interrupts.count("MAPPING_CONFIRMATION"),
+            "writebackPreviewCount": (
+                len(resources) if snapshot.get("writebackJob") is not None else None
+            ),
+        }
+        missing = sorted(
+            key for key, value in coverage_fields.items() if value is None
+        )
+        coverage = (len(coverage_fields) - len(missing)) / len(coverage_fields)
         operational = {
             **required,
             "nodeTrace": [str(item["node"]) for item in per_node if item.get("node")],
             "perNode": per_node,
             "toolStatuses": tool_statuses,
-            "narrativeAttempts": {
-                "maximumPerScope": max(retrieval_attempts.values(), default=0),
-                "total": sum(retrieval_attempts.values()),
-            },
+            "narrativeAttempts": narrative_attempts,
             "mappingInterrupts": interrupts.count("MAPPING_CONFIRMATION"),
             "writebackPreviewCount": len(resources),
         }
         return (
             OnlineMetrics(
+                autoApprovedAmbiguous=auto_approved_ambiguous,
                 acceptedCitationValidity=(len(valid) / len(accepted) if accepted else 1.0),
                 exactIdentifierAccuracy=(
                     len(exact_correct) / len(exact) if exact else 1.0
@@ -286,8 +358,16 @@ class OnlineEvaluationRunner:
             "x-api-key": self.api_key,
             "x-reviewer-id": self.reviewer_id,
         }
+        base_url = self.base_url
+        if case.serviceProfile != "default":
+            base_url = self.profile_base_urls.get(case.serviceProfile, "")
+            if not base_url:
+                raise OnlineEvaluationError(
+                    "SERVICE_PROFILE_UNAVAILABLE",
+                    f"No API URL is configured for profile {case.serviceProfile!r}.",
+                )
         async with httpx.AsyncClient(
-            base_url=self.base_url,
+            base_url=base_url,
             headers=headers,
             transport=self.transport,
             timeout=120,
@@ -400,12 +480,10 @@ class OnlineEvaluationRunner:
                 )
             audit = await self._request(client, "GET", f"/api/reviews/{review_id}/audit")
         metrics, operational, missing = self._metrics(snapshot, audit, interrupts)
-        expected_types = set(case.expected.get("findingTypes") or [])
-        observed_types = {str(item.get("reviewType")) for item in snapshot.get("findings") or []}
         passed = (
             snapshot.get("status") == "SIGNED_OFF"
             and snapshot.get("writebackStatus") in {"PREPARED", "COMMITTED"}
-            and expected_types <= observed_types
+            and case_expectations_met(case, snapshot, operational, metrics)
             and metrics.metricsCoverage == 1.0
         )
         return OnlineCaseResult(
@@ -628,6 +706,10 @@ def main() -> None:
     parser.add_argument("--base-url", default=os.getenv("REVIEW_API_URL", "http://127.0.0.1:8020"))
     parser.add_argument("--api-key", default=os.getenv("REVIEW_API_KEY", ""))
     parser.add_argument("--reviewer-id", default=os.getenv("REVIEW_API_REVIEWER_ID", "pharmacist-eval"))
+    parser.add_argument(
+        "--rag-unavailable-base-url",
+        default=os.getenv("REVIEW_API_RAG_UNAVAILABLE_URL", ""),
+    )
     parser.add_argument("--commit-synthetic", action="store_true")
     args = parser.parse_args()
     if args.commit_synthetic:
@@ -638,6 +720,11 @@ def main() -> None:
         api_key=args.api_key,
         reviewer_id=args.reviewer_id,
         commit_synthetic=args.commit_synthetic,
+        profile_base_urls=(
+            {"rag-unavailable": args.rag_unavailable_base_url}
+            if args.rag_unavailable_base_url
+            else {}
+        ),
     )
     results = asyncio.run(_run_all(cases, runner))
     report = build_online_report(results)

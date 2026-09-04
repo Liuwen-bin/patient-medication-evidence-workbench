@@ -14,8 +14,10 @@ from medication_review_agent.online_evaluation import (
     OnlineCase,
     OnlineCaseResult,
     OnlineEvaluationRunner,
+    OnlineMetrics,
     _run_all,
     build_online_report,
+    case_expectations_met,
     load_online_cases,
     write_sanitized_online_report,
 )
@@ -240,6 +242,10 @@ def test_live_launcher_enforces_isolation_and_secret_path_boundary() -> None:
     assert "DEPENDENCY_START_FAILED" in text
     assert "Get-FileHash" in text
     assert "SOURCE_DATABASE_CHANGED" in text
+    assert "MILVUS_URI" in text
+    assert "8011" in text
+    assert "8021" in text
+    assert "--rag-unavailable-base-url" in text
 
 
 @pytest.mark.asyncio
@@ -276,3 +282,85 @@ def test_online_report_marks_only_observed_real_components() -> None:
     assert report["execution"]["realDatabases"] is False
     assert report["execution"]["completed"] is True
     assert report["acceptancePassed"] is False
+
+
+def test_case_expectations_check_mapping_preview_and_retrieval_bounds() -> None:
+    case = OnlineCase(
+        caseId="declarative-case",
+        patientId="DEMO-LIVE-001",
+        question="核查标签警告",
+        expected={
+            "minimumMapped": 1,
+            "minimumUnmapped": 1,
+            "mappingInterrupts": 1,
+            "findingTypes": ["LABEL_EVIDENCE_REVIEW"],
+            "acceptedCitationValidity": 1.0,
+            "autoApprovedAmbiguous": 0,
+            "maximumNarrativeAttemptsPerScope": 2,
+            "requiresWritebackPreview": True,
+        },
+    )
+    snapshot = {
+        "medicationMappings": [
+            {"matchClass": "HUMAN_CONFIRMED", "selectedProductId": "product-1"},
+            {"matchClass": "UNMAPPED", "selectedProductId": None},
+        ],
+        "findings": [{"reviewType": "LABEL_EVIDENCE_REVIEW"}],
+    }
+    operational = {
+        "mappingInterrupts": 1,
+        "narrativeAttempts": {"maximumPerScope": 2},
+        "writebackPreviewCount": 2,
+    }
+
+    assert case_expectations_met(case, snapshot, operational, OnlineMetrics())
+    operational["narrativeAttempts"]["maximumPerScope"] = 3
+    assert not case_expectations_met(case, snapshot, operational, OnlineMetrics())
+
+
+def test_online_metrics_flags_ambiguous_product_selected_without_interrupt() -> None:
+    snapshot = _snapshot("SIGNED_OFF", 4)
+    snapshot["medicationMappings"] = [{
+        "medicationId": "med-1",
+        "matchClass": "FUZZY_CANDIDATE",
+        "selectedProductId": "DRUG_PRODUCT::10191-1246",
+    }]
+    audit = [{
+        "node": "map_medications",
+        "tool": "resolve_medication",
+        "resultStatus": "OK",
+        "latencyMs": 3,
+        "retryCount": 0,
+    }]
+
+    metrics, _, _ = OnlineEvaluationRunner._metrics(snapshot, audit, [])
+
+    assert metrics.autoApprovedAmbiguous == 1
+
+
+@pytest.mark.asyncio
+async def test_online_runner_routes_declared_service_profile() -> None:
+    observed_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_hosts.append(str(request.url.host))
+        return httpx.Response(503, json={"detail": "degraded profile reached"})
+
+    runner = OnlineEvaluationRunner(
+        base_url="http://default.test",
+        profile_base_urls={"rag-unavailable": "http://degraded.test"},
+        api_key="test-key",
+        reviewer_id="pharmacist-eval",
+        transport=httpx.MockTransport(handler),
+    )
+    case = OnlineCase(
+        caseId="profile-case",
+        patientId="DEMO-LIVE-DEG",
+        question="核查标签警告",
+        serviceProfile="rag-unavailable",
+    )
+
+    with pytest.raises(Exception, match="degraded profile reached"):
+        await runner.run_case(case)
+
+    assert observed_hosts == ["degraded.test"]

@@ -16,6 +16,7 @@ $runReport = Join-Path $runDirectory "online-integration-report.json"
 $sourceHealthDb = Join-Path $HealthRoot "data/chinese-demo-record.sqlite"
 $evaluationHealthDb = Join-Path $runDirectory "health-eval.sqlite"
 $startedProcesses = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+$priorMilvusUri = $env:MILVUS_URI
 
 function Write-FailureReport {
     param([string]$Code, [string]$Stage, [string]$ExceptionType)
@@ -178,12 +179,38 @@ try {
         throw [System.InvalidOperationException]::new("Review API health contract failed.")
     }
 
+    $stage = "start_degraded_profile"
+    if ((Test-TcpPort -Port 8011) -or (Test-TcpPort -Port 8021)) {
+        throw [System.InvalidOperationException]::new("Degraded profile ports are already owned.")
+    }
+    $env:MILVUS_URI = "http://127.0.0.1:65534"
+    Start-OwnedProcess -Name "drug-mcp-rag-unavailable" -WorkingDirectory $DrugRoot `
+        -Arguments @("-m", "dailymed_lightrag.drug_mcp_server", "--transport", "http", "--host", "127.0.0.1", "--port", "8011") | Out-Null
+    Wait-TcpPort -Port 8011 -ServiceName "Degraded Drug MCP"
+    $env:DRUG_MCP_URL = "http://127.0.0.1:8011/mcp"
+    $env:REVIEW_API_PORT = "8021"
+    $env:REVIEW_DB_PATH = Join-Path $runDirectory "reviews-rag-unavailable.sqlite"
+    $env:REVIEW_CHECKPOINT_DB = Join-Path $runDirectory "review-checkpoints-rag-unavailable.sqlite"
+    Start-OwnedProcess -Name "review-api-rag-unavailable" -WorkingDirectory $reviewRoot `
+        -Arguments @("-c", '"from medication_review_agent.api import main; main()"') | Out-Null
+    Wait-TcpPort -Port 8021 -ServiceName "Degraded Review API"
+    $degradedHealth = Invoke-RestMethod -Uri "http://127.0.0.1:8021/api/health" -TimeoutSec 5
+    if ($degradedHealth.status -ne "healthy") {
+        throw [System.InvalidOperationException]::new("Degraded Review API health contract failed.")
+    }
+    if ([string]::IsNullOrEmpty($priorMilvusUri)) {
+        Remove-Item Env:MILVUS_URI -ErrorAction SilentlyContinue
+    } else {
+        $env:MILVUS_URI = $priorMilvusUri
+    }
+
     $stage = "run_online_cases"
     $arguments = @(
         "-m", "medication_review_agent.online_evaluation",
         "--cases", (Join-Path $reviewRoot "evaluation/online-cases.jsonl"),
         "--output", $runReport,
         "--base-url", "http://127.0.0.1:8020",
+        "--rag-unavailable-base-url", "http://127.0.0.1:8021",
         "--api-key", $env:REVIEW_API_KEY,
         "--reviewer-id", $env:REVIEW_API_REVIEWER_ID
     )
@@ -219,6 +246,11 @@ catch {
     exit 1
 }
 finally {
+    if ([string]::IsNullOrEmpty($priorMilvusUri)) {
+        Remove-Item Env:MILVUS_URI -ErrorAction SilentlyContinue
+    } else {
+        $env:MILVUS_URI = $priorMilvusUri
+    }
     foreach ($process in $startedProcesses) {
         if (-not $process.HasExited) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
