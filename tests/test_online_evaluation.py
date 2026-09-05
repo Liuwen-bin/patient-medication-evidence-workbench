@@ -560,6 +560,12 @@ def test_online_report_explains_model_fallback_acceptance_failure() -> None:
     assert partial_model_report["execution"]["realModel"] is False
     assert partial_model_report["acceptancePassed"] is False
 
+    single_case_report = build_online_report(
+        _accepted_online_results(model_fallback=False)[:1]
+    )
+    assert single_case_report["execution"]["realModel"] is False
+    assert single_case_report["execution"]["realDatabases"] is False
+
 
 def test_online_report_requires_each_case_to_observe_both_real_mcp_services() -> None:
     results = _accepted_online_results(model_fallback=False)
@@ -859,6 +865,65 @@ async def test_non_version_conflict_is_not_reported_as_stale_review() -> None:
 
     assert raised.value.code == "REVIEW_API_ERROR"
     assert "no eligible writeback content" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_stale_writeback_commit_refreshes_once_without_replaying_post() -> None:
+    commit_posts = 0
+    refresh_gets = 0
+    prepared = _snapshot("SIGNED_OFF", 2)
+    prepared["writebackStatus"] = "PREPARED"
+    prepared["writebackJob"] = {
+        "jobId": "writeback-online-review-1",
+        "reviewVersion": 1,
+        "expectedVersion": 1,
+        "bundleHash": "a" * 64,
+        "resources": [{"resourceType": "Task", "id": "mr-task-1"}],
+        "warnings": [],
+        "blockedFindings": [],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal commit_posts, refresh_gets
+        path = request.url.path
+        if path == "/api/reviews":
+            return httpx.Response(201, json=_snapshot("CREATED", 0))
+        if path.endswith("/run"):
+            signed = _snapshot("SIGNED_OFF", 1)
+            signed["writebackStatus"] = "NOT_REQUESTED"
+            return httpx.Response(200, json=signed)
+        if path.endswith("/writeback/prepare"):
+            return httpx.Response(200, json=prepared)
+        if path.endswith("/writeback/commit"):
+            commit_posts += 1
+            return httpx.Response(
+                409,
+                json={"detail": "Review version conflict"},
+            )
+        if request.method == "GET" and path.endswith("/online-review"):
+            refresh_gets += 1
+            return httpx.Response(200, json=prepared)
+        return httpx.Response(404, json={"detail": "not found"})
+
+    runner = OnlineEvaluationRunner(
+        base_url="http://review.test",
+        api_key="test-key",
+        reviewer_id="pharmacist-eval",
+        transport=httpx.MockTransport(handler),
+        commit_synthetic=True,
+    )
+    case = OnlineCase(
+        caseId="stale-commit",
+        patientId="DEMO-LIVE-001",
+        question="核查标签警告",
+    )
+
+    with pytest.raises(OnlineEvaluationError) as captured:
+        await runner.run_case(case)
+
+    assert captured.value.code == "STALE_REVIEW_VERSION"
+    assert commit_posts == 1
+    assert refresh_gets == 1
 
 
 def test_online_metrics_reject_partial_multi_product_citation_coverage(
@@ -1255,7 +1320,13 @@ def test_unmeasured_online_safety_metrics_reduce_coverage() -> None:
 
 def test_online_metrics_exposes_model_failure_code() -> None:
     snapshot = _measured_snapshot()
-    snapshot["modelCalls"][-1].update({
+    snapshot["modelCalls"].insert(0, {
+        "modelId": "configured-model",
+        "promptVersion": "intent-v1",
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "estimatedCost": 0.0,
+        "latencyMs": 5,
         "fallback": True,
         "failureCode": "MODEL_UPSTREAM_ERROR",
     })
@@ -1267,7 +1338,9 @@ def test_online_metrics_exposes_model_failure_code() -> None:
         case=_metric_case(),
     )
 
+    assert operational["modelFallback"] is True
     assert operational["modelFailureCode"] == "MODEL_UPSTREAM_ERROR"
+    assert operational["modelFailureCodes"] == ["MODEL_UPSTREAM_ERROR"]
 
 
 @pytest.mark.asyncio

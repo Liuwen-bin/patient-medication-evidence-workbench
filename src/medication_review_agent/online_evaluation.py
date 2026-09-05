@@ -744,8 +744,24 @@ class OnlineEvaluationRunner:
             duplicate_writeback_resources = _count_duplicate_writeback_resources(
                 database_before, database_after
             )
-        model_calls = snapshot.get("modelCalls") or []
+        model_calls = [
+            item for item in snapshot.get("modelCalls") or []
+            if isinstance(item, dict)
+        ]
         model = model_calls[-1] if model_calls else {}
+        model_failure_codes = list(dict.fromkeys(
+            str(item["failureCode"])
+            for item in model_calls
+            if item.get("failureCode")
+        ))
+        model_fallback = (
+            any(
+                item.get("fallback") is True or bool(item.get("failureCode"))
+                for item in model_calls
+            )
+            if model_calls
+            else None
+        )
         state_metrics = snapshot.get("metrics") or {}
         retrieval_attempts = {
             str(key): int(value)
@@ -783,7 +799,7 @@ class OnlineEvaluationRunner:
             "estimatedCost": state_metrics.get("estimatedCost"),
             "modelId": model.get("modelId"),
             "promptVersion": model.get("promptVersion"),
-            "modelFallback": model.get("fallback"),
+            "modelFallback": model_fallback,
         }
         coverage_fields = {
             **required,
@@ -810,7 +826,10 @@ class OnlineEvaluationRunner:
         coverage = (len(coverage_fields) - len(missing)) / len(coverage_fields)
         operational = {
             **required,
-            "modelFailureCode": model.get("failureCode"),
+            "modelFailureCode": (
+                model_failure_codes[0] if model_failure_codes else None
+            ),
+            "modelFailureCodes": model_failure_codes,
             "nodeTrace": [str(item["node"]) for item in per_node if item.get("node")],
             "perNode": per_node,
             "toolStatuses": tool_statuses,
@@ -874,6 +893,7 @@ class OnlineEvaluationRunner:
             while transitions < 30:
                 transitions += 1
                 status = snapshot.get("status")
+                active_mutation: str | None = None
                 try:
                     if status == "AWAITING_PATIENT_CONFIRMATION":
                         interrupts.append("PATIENT_CONFIRMATION")
@@ -938,6 +958,7 @@ class OnlineEvaluationRunner:
                                 },
                             )
                         if self.commit_synthetic and snapshot.get("writebackStatus") == "PREPARED":
+                            active_mutation = "writeback_commit"
                             for _ in range(2):
                                 snapshot = await self._request(
                                     client,
@@ -962,6 +983,8 @@ class OnlineEvaluationRunner:
                     snapshot = await self._request(
                         client, "GET", f"/api/reviews/{review_id}"
                     )
+                    if active_mutation == "writeback_commit":
+                        raise
                     refreshed_conflict = True
             else:
                 raise OnlineEvaluationError(
@@ -1101,10 +1124,11 @@ def _git_sha() -> str:
 
 def build_online_report(results: list[OnlineCaseResult]) -> dict[str, Any]:
     metrics = _aggregate(results)
+    case_count_accepted = len(results) == 5
     observed_tools_by_case = [
         set(result.operational.get("toolStatuses", {})) for result in results
     ]
-    health_observed = bool(results) and all(
+    health_observed = case_count_accepted and all(
         "get_medication_review_context" in observed_tools
         for observed_tools in observed_tools_by_case
     )
@@ -1115,27 +1139,30 @@ def build_online_report(results: list[OnlineCaseResult]) -> dict[str, Any]:
         "compare_product_ingredients",
         "validate_evidence",
     }
-    drug_observed = bool(results) and all(
+    drug_observed = case_count_accepted and all(
         bool(observed_tools & drug_tools)
         for observed_tools in observed_tools_by_case
     )
-    real_model = bool(results) and all(
+    real_model = case_count_accepted and all(
         result.operational.get("modelId")
         and result.operational.get("modelFallback") is False
         for result in results
     )
     real_databases = health_observed and drug_observed
-    case_count_accepted = len(results) == 5
     metrics_accepted = online_acceptance(metrics)
     acceptance_failure_codes: set[str] = set()
     if not case_count_accepted:
         acceptance_failure_codes.add("EXPECTED_CASE_COUNT_NOT_MET")
     if not real_model:
         model_failure_codes = {
-            str(result.operational["modelFailureCode"])
+            str(code)
             for result in results
             if result.operational.get("modelFallback") is True
-            and result.operational.get("modelFailureCode")
+            for code in (
+                result.operational.get("modelFailureCodes")
+                or [result.operational.get("modelFailureCode")]
+            )
+            if code
         }
         acceptance_failure_codes.update(
             model_failure_codes or {"REAL_MODEL_NOT_OBSERVED"}
