@@ -56,7 +56,10 @@ def test_published_results_keep_offline_and_online_truth_separate() -> None:
     assert offline["execution"]["realModel"] is False
     assert offline["summary"]["caseCount"] == 15
     assert online["execution"]["mode"] == "online_integration"
-    assert online["acceptancePassed"] is False
+    assert online["execution"]["realModel"] is True
+    assert online["execution"]["realDatabases"] is True
+    assert online["acceptancePassed"] is True
+    assert online["acceptanceFailureCodes"] == []
     assert len(online["cases"]) == 5
     published = json.dumps(online, ensure_ascii=False).casefold()
     assert "http://" not in published

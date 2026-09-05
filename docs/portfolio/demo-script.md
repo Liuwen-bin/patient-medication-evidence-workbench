@@ -41,9 +41,9 @@
 ### 2:40-3:00 审计与结果
 
 展示审计时间线和评测摘要。说明：离线 15/15 是 Fixture 回归；最新真实在线运行在 Health/Drug
-MCP 和真实数据库上完成 5/5，所有安全与质量指标达标。五次模型规划均因
-`MODEL_UPSTREAM_ERROR` 显式回退，所以 `realModel=false`、完整在线验收仍不通过。这同时证明
-业务闭环能安全降级，也没有把确定性回退冒充真实模型质量。
+MCP 和真实数据库上完成 5/5，所有安全与质量指标达标。五次模型规划均由配置模型完成且没有
+fallback，报告为 `realModel=true`、`realDatabases=true`、`acceptancePassed=true`。此前连接
+重置与结构化输出不兼容的失败仍保留在复盘中，用于说明降级和兼容性修复过程。
 
 ## 十分钟技术叙事
 
@@ -98,14 +98,15 @@ Health MCP 保持患者范围和 FHIR 语义；Drug MCP 保持产品、SPL、Neo
 
 第一次真实运行暴露 Milvus 未启动，第二次暴露 MCP session 关闭时提前 finalize 共享 LightRAG。
 兼容层改为持久 Streamable HTTP session，并在失败后重连；最新运行已在真实 Neo4j/Milvus 和
-两个 MCP 上完成 5/5，引用、映射、缺失信息、完成率与覆盖率均为 1.0。模型端点仍出现
-`APIConnectionError/httpx.ReadError`，五次规划都记录 `MODEL_UPSTREAM_ERROR` 并回退，因此
-公开报告仍明确 `acceptancePassed=false`。详见 `tradeoffs-and-failures.md`。
+两个 MCP 上完成 5/5，引用、映射、缺失信息、完成率与覆盖率均为 1.0。模型端点恢复后又暴露
+`function_calling` 不兼容：有 token 但没有 tool call 或可解析结果。项目改用端点真实支持的
+`json_schema`，最终五次规划均无 fallback，公开报告 `acceptancePassed=true`。详见
+`tradeoffs-and-failures.md`。
 
 ### 9:00-10:00 演进条件
 
-当前先恢复模型端点并取得 `realModel=true` 的五例证据，再谈部署。多 worker 需要共享锁与幂等
-协调；多 Agent 只有在新增至少两个独立知识域，或十种以上用药造成可测上下文/延迟瓶颈时成立。
+当前已取得 `realModel=true` 的五例证据。下一步是跨模型供应商结构化输出契约、多 worker 共享锁
+与幂等协调；多 Agent 只有在新增至少两个独立知识域，或十种以上用药造成可测上下文/延迟瓶颈时成立。
 
 ## 八个常见追问
 

@@ -1,14 +1,14 @@
 {
   "schemaVersion": "1.0",
-  "generatedAt": "2026-09-05T00:24:44.527496+00:00",
-  "gitSha": "9bdab35225cd67b1cfb303c151e99d2b9dfbfe7f",
+  "generatedAt": "2026-09-05T03:54:31.032320+00:00",
+  "gitSha": "978f9b3446e14308ac60c462760e4cf7d37a32e0",
   "execution": {
     "mode": "online_integration",
     "healthGateway": "HealthRecordGateway",
     "drugGateway": "DrugEvidenceGateway",
     "planner": "ConfiguredStructuredLLMPlanner",
     "network": true,
-    "realModel": false,
+    "realModel": true,
     "realDatabases": true,
     "completed": true,
     "services": {
@@ -40,11 +40,8 @@
     "taskCompletionRate": 1.0,
     "metricsCoverage": 1.0
   },
-  "acceptancePassed": false,
-  "acceptanceFailureCodes": ["MODEL_UPSTREAM_ERROR"],
-  "failure": {
-    "code": "MODEL_UPSTREAM_ERROR"
-  },
+  "acceptancePassed": true,
+  "acceptanceFailureCodes": [],
   "cases": [
     {"caseId": "online-single-complete", "passed": true, "failureCode": null},
     {"caseId": "online-ambiguous-variant", "passed": true, "failureCode": null},

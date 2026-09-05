@@ -29,7 +29,7 @@ Patient ID、原始证据、服务端点、prompt、隐藏推理或凭据。
 
 ## 最新在线结论
 
-提交 `9bdab35` 的运行在真实 Health/Drug MCP 与数据库上完成 5/5 个 case，每个 case 都独立
-观察到两个 MCP，聚合指标全部达到阈值；模型上游连接被重置，五次规划均显式回退。因此该
-运行可证明真实业务链路和安全降级，但 `realModel=false`、`acceptancePassed=false`，报告的
-`acceptanceFailureCodes` 为 `MODEL_UPSTREAM_ERROR`，不能作为真实模型质量通过的证据。
+提交 `978f9b3` 的运行在真实 Health/Drug MCP 与数据库上完成 5/5 个 case，每个 case 都独立
+观察到两个 MCP，五次模型规划均成功且没有 fallback。聚合质量与安全指标全部达到阈值，报告
+为 `realModel=true`、`realDatabases=true`、`acceptancePassed=true`，且
+`acceptanceFailureCodes` 为空。此前连接重置和结构化输出不兼容的运行仍记录在失败复盘中。

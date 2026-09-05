@@ -145,11 +145,11 @@ powershell -ExecutionPolicy Bypass -File scripts/run-live-evaluation.ps1
 information recall 和 task completion 均为 1.0。它使用 `FixtureHealthGateway`、
 `FixtureDrugGateway` 与 `DeterministicPlanner`，不能代表线上质量或延迟。
 
-最新真实在线运行（`9bdab35`）：Health/Drug MCP 与真实数据库链路完成 5/5 个 case，全部到达
-`SIGNED_OFF` 并生成写回预览；引用有效率、精确标识准确率、缺失信息召回率、任务完成率和
-指标覆盖率均为 1.0，五项零容忍安全计数均为 0。每个 case 都独立观察到两个 MCP；模型端点在五次规划中都发生
-`MODEL_UPSTREAM_ERROR` 并显式回退，因此 `realModel=false`、整体 `acceptancePassed=false`。
-这个结果证明业务闭环和降级路径可用，但不代表真实模型质量已经验收。
+最新真实在线运行（`978f9b3`）：Health/Drug MCP 与真实数据库链路完成 5/5 个 case，全部到达
+`SIGNED_OFF` 和 `COMMITTED`；引用有效率、精确标识准确率、缺失信息召回率、任务完成率和
+指标覆盖率均为 1.0，五项零容忍安全计数均为 0。每个 case 都独立观察到两个 MCP，五次规划
+均由配置模型完成且没有 fallback，因此 `realModel=true`、`realDatabases=true`、
+`acceptancePassed=true`。
 
 可公开结果：[离线摘要](docs/portfolio/results/offline-regression-summary.json) ·
 [在线摘要](docs/portfolio/results/online-integration-summary.json) ·
@@ -179,7 +179,7 @@ MedicationRequest 始终称为“活动用药医嘱”，不声称患者实际�
 
 ## 后续演进条件
 
-- 恢复模型端点后重跑五例在线评测，要求 `realModel=true` 后才能把当前 5/5 业务完成升级为完整在线验收。
+- 为每个候选模型供应端先验证原生 `json_schema` 结构化输出契约，再接入在线评测。
 - 用独立临床标注集验证缺失信息 recall，再讨论生产阈值和告警。
 - 多 worker 前把 mutation lock、checkpoint lease 和幂等协调迁移到共享基础设施。
 - 只有新增相互作用库/指南等独立知识域，或单患者十种以上用药造成可测延迟瓶颈时，才拆分多 Agent。
