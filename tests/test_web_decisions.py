@@ -352,6 +352,44 @@ def test_sign_off_conflict_refreshes_without_replaying_old_mutation(
     assert post_count == 1
 
 
+def test_writeback_commit_conflict_refreshes_without_replaying_old_mutation(
+    page: Page, live_server_url: str
+) -> None:
+    snapshot = _review(status="SIGNED_OFF")
+    snapshot["writebackStatus"] = "PREPARED"
+    snapshot["writebackJob"] = {
+        "jobId": "writeback-review-ui-3",
+        "reviewVersion": 3,
+        "expectedVersion": 3,
+        "bundleHash": "a" * 64,
+        "resources": [{"resourceType": "Task", "id": "mr-task-1"}],
+        "warnings": [],
+        "blockedFindings": [],
+    }
+    post_count = 0
+
+    def conflict(route: Route) -> None:
+        nonlocal post_count
+        post_count += 1
+        route.fulfill(
+            status=409,
+            content_type="application/json",
+            body=json.dumps({"detail": "Review version conflict"}),
+        )
+
+    _mock_review(page, snapshot, conflict)
+    page.goto(f"{live_server_url}/?review=review-ui")
+    page.get_by_role("button", name="确认写回").click()
+    page.get_by_label("我确认写回以上 FHIR 资源").check()
+    page.locator("#confirm-writeback").click()
+
+    expect(page.locator("#workbench-notice")).to_have_text(
+        "状态已更新，请重新确认"
+    )
+    expect(page.get_by_role("dialog", name="确认 FHIR 写回")).to_be_hidden()
+    assert post_count == 1
+
+
 def test_signed_review_previews_then_confirms_writeback(
     page: Page, live_server_url: str
 ) -> None:
