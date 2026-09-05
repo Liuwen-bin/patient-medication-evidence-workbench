@@ -37,6 +37,7 @@ def test_empty_evaluation_suite_cannot_pass() -> None:
 def test_every_run_requires_latency_and_cost_fields() -> None:
     report = score_cases([CaseResult(caseId="missing-metrics", passed=True, metrics={"latencyMs": 10})])
     assert report["runsWithCompleteOperationalMetrics"] == 0
+    assert report["summary"]["operationalMetricsCoverage"] == 0.0
 
 
 def test_fixture_contains_all_fifteen_stable_cases() -> None:
@@ -117,3 +118,4 @@ def test_full_synthetic_evaluation_records_graph_and_operational_metrics(tmp_pat
         if item["caseId"] != "fuzzy_candidate_not_approved"
     )
     assert report["runsWithCompleteOperationalMetrics"] == 15
+    assert report["summary"]["operationalMetricsCoverage"] == 1.0

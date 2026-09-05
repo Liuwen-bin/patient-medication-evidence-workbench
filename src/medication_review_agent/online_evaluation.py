@@ -810,6 +810,7 @@ class OnlineEvaluationRunner:
         coverage = (len(coverage_fields) - len(missing)) / len(coverage_fields)
         operational = {
             **required,
+            "modelFailureCode": model.get("failureCode"),
             "nodeTrace": [str(item["node"]) for item in per_node if item.get("node")],
             "perNode": per_node,
             "toolStatuses": tool_statuses,
@@ -1100,28 +1101,49 @@ def _git_sha() -> str:
 
 def build_online_report(results: list[OnlineCaseResult]) -> dict[str, Any]:
     metrics = _aggregate(results)
-    observed_tools = {
-        tool
-        for result in results
-        for tool in result.operational.get("toolStatuses", {})
-    }
-    health_observed = "get_medication_review_context" in observed_tools
-    drug_observed = bool(
-        observed_tools
-        & {
-            "resolve_medication",
-            "get_product_facts",
-            "search_label_evidence",
-            "compare_product_ingredients",
-            "validate_evidence",
-        }
+    observed_tools_by_case = [
+        set(result.operational.get("toolStatuses", {})) for result in results
+    ]
+    health_observed = bool(results) and all(
+        "get_medication_review_context" in observed_tools
+        for observed_tools in observed_tools_by_case
     )
-    real_model = any(
+    drug_tools = {
+        "resolve_medication",
+        "get_product_facts",
+        "search_label_evidence",
+        "compare_product_ingredients",
+        "validate_evidence",
+    }
+    drug_observed = bool(results) and all(
+        bool(observed_tools & drug_tools)
+        for observed_tools in observed_tools_by_case
+    )
+    real_model = bool(results) and all(
         result.operational.get("modelId")
         and result.operational.get("modelFallback") is False
         for result in results
     )
     real_databases = health_observed and drug_observed
+    case_count_accepted = len(results) == 5
+    metrics_accepted = online_acceptance(metrics)
+    acceptance_failure_codes: set[str] = set()
+    if not case_count_accepted:
+        acceptance_failure_codes.add("EXPECTED_CASE_COUNT_NOT_MET")
+    if not real_model:
+        model_failure_codes = {
+            str(result.operational["modelFailureCode"])
+            for result in results
+            if result.operational.get("modelFallback") is True
+            and result.operational.get("modelFailureCode")
+        }
+        acceptance_failure_codes.update(
+            model_failure_codes or {"REAL_MODEL_NOT_OBSERVED"}
+        )
+    if not real_databases:
+        acceptance_failure_codes.add("REAL_DATABASES_NOT_OBSERVED")
+    if not metrics_accepted:
+        acceptance_failure_codes.add("ONLINE_METRICS_NOT_ACCEPTED")
     return {
         "schemaVersion": "1.0",
         "generatedAt": datetime.now(UTC).isoformat(),
@@ -1154,11 +1176,9 @@ def build_online_report(results: list[OnlineCaseResult]) -> dict[str, Any]:
         },
         "metrics": metrics.model_dump(mode="json"),
         "acceptancePassed": (
-            len(results) == 5
-            and real_model
-            and real_databases
-            and online_acceptance(metrics)
+            case_count_accepted and real_model and real_databases and metrics_accepted
         ),
+        "acceptanceFailureCodes": sorted(acceptance_failure_codes),
         "cases": [item.model_dump(mode="json") for item in results],
     }
 
@@ -1174,6 +1194,7 @@ def write_sanitized_online_report(
         "thresholds": report.get("thresholds", {}),
         "metrics": report.get("metrics", {}),
         "acceptancePassed": report.get("acceptancePassed", False),
+        "acceptanceFailureCodes": report.get("acceptanceFailureCodes", []),
         "cases": [
             {
                 key: item.get(key)

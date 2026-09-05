@@ -518,6 +518,59 @@ def test_online_report_marks_only_observed_real_components() -> None:
     assert report["acceptancePassed"] is False
 
 
+def _accepted_online_results(*, model_fallback: bool) -> list[OnlineCaseResult]:
+    metrics = OnlineMetrics(
+        acceptedCitationValidity=1.0,
+        exactIdentifierAccuracy=1.0,
+        missingInformationRecall=1.0,
+        taskCompletionRate=1.0,
+        metricsCoverage=1.0,
+    )
+    return [
+        OnlineCaseResult(
+            caseId=f"case-{index}",
+            passed=True,
+            durationMs=1,
+            metrics=metrics,
+            operational={
+                "modelId": "configured-model",
+                "modelFallback": model_fallback,
+                "modelFailureCode": (
+                    "MODEL_UPSTREAM_ERROR" if model_fallback else None
+                ),
+                "toolStatuses": {
+                    "get_medication_review_context": {"OK": 1},
+                    "resolve_medication": {"OK": 1},
+                },
+            },
+        )
+        for index in range(5)
+    ]
+
+
+def test_online_report_explains_model_fallback_acceptance_failure() -> None:
+    results = _accepted_online_results(model_fallback=True)
+    report = build_online_report(results)
+
+    assert report["acceptancePassed"] is False
+    assert report["acceptanceFailureCodes"] == ["MODEL_UPSTREAM_ERROR"]
+
+    results[0].operational["modelFallback"] = False
+    partial_model_report = build_online_report(results)
+    assert partial_model_report["execution"]["realModel"] is False
+    assert partial_model_report["acceptancePassed"] is False
+
+
+def test_online_report_requires_each_case_to_observe_both_real_mcp_services() -> None:
+    results = _accepted_online_results(model_fallback=False)
+    results[0].operational["toolStatuses"].pop("resolve_medication")
+
+    report = build_online_report(results)
+
+    assert report["execution"]["realDatabases"] is False
+    assert report["acceptancePassed"] is False
+
+
 def test_case_expectations_check_mapping_preview_and_retrieval_bounds() -> None:
     case = OnlineCase(
         caseId="declarative-case",
@@ -1198,6 +1251,23 @@ def test_unmeasured_online_safety_metrics_reduce_coverage() -> None:
         "originalResourcesModified",
         "duplicateWritebackResources",
     } <= set(missing)
+
+
+def test_online_metrics_exposes_model_failure_code() -> None:
+    snapshot = _measured_snapshot()
+    snapshot["modelCalls"][-1].update({
+        "fallback": True,
+        "failureCode": "MODEL_UPSTREAM_ERROR",
+    })
+
+    _, operational, _ = OnlineEvaluationRunner._metrics(
+        snapshot,
+        _audit(),
+        [],
+        case=_metric_case(),
+    )
+
+    assert operational["modelFailureCode"] == "MODEL_UPSTREAM_ERROR"
 
 
 @pytest.mark.asyncio

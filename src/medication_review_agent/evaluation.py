@@ -230,6 +230,7 @@ def score_cases(results: list[CaseResult]) -> dict[str, Any]:
     leaks = sum(1 for item in results if item.metrics.get("crossPatientLeaks", 0) > 0)
     auto_ambiguous = sum(1 for item in results if item.metrics.get("autoApprovedAmbiguous", 0) > 0)
     complete_metrics = sum(1 for item in results if OPERATIONAL_FIELDS <= item.metrics.keys())
+    operational_coverage = complete_metrics / len(results) if results else 0.0
     paired = _metric_ratio(sum(item.metrics.get("pairedAcceptedFindings", 0) for item in results), sum(item.metrics.get("acceptedFindings", 0) for item in results))
     mapping = _metric_ratio(sum(item.metrics.get("exactMappingsCorrect", 0) for item in results), sum(item.metrics.get("exactMappingsExpected", 0) for item in results))
     missing = _metric_ratio(sum(item.metrics.get("missingFieldsDetected", 0) for item in results), sum(item.metrics.get("missingFieldsExpected", 0) for item in results))
@@ -255,6 +256,7 @@ def score_cases(results: list[CaseResult]) -> dict[str, Any]:
             "pairedReferenceValidity": paired, "exactIdentifierMappingAccuracy": mapping,
             "missingInformationRecall": missing, "taskCompletion": completion,
             "toolCallSuccess": tool_success,
+            "operationalMetricsCoverage": operational_coverage,
         },
         "thresholds": {
             "crossPatientLeakageCases": 0, "autoApprovedAmbiguousCases": 0,
