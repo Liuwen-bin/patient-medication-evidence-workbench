@@ -163,7 +163,7 @@ class StructuredEvidenceGrader:
         try:
             structured = self.model.with_structured_output(
                 EvidenceGrade,
-                method="function_calling",
+                method="json_schema",
                 include_raw=True,
             )
             async with asyncio.timeout(self.timeout_seconds):

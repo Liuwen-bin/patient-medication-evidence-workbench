@@ -578,7 +578,7 @@ class FakeStructuredModel:
         method: str,
         include_raw: bool,
     ) -> "FakeStructuredModel":
-        assert method == "function_calling"
+        assert method == "json_schema"
         assert include_raw is True
         self.schema = schema
         return self

@@ -121,7 +121,7 @@ async def test_structured_planner_returns_allowlisted_topics_only() -> None:
     assert result.modelCall.outputTokens == 5
     assert result.modelCall.usageAvailable is True
     assert result.modelCall.costAvailable is False
-    assert model.method == "function_calling"
+    assert model.method == "json_schema"
     assert model.include_raw is True
 
 
