@@ -145,9 +145,9 @@ powershell -ExecutionPolicy Bypass -File scripts/run-live-evaluation.ps1
 information recall 和 task completion 均为 1.0。它使用 `FixtureHealthGateway`、
 `FixtureDrugGateway` 与 `DeterministicPlanner`，不能代表线上质量或延迟。
 
-最新真实在线运行（`f358ee1`）：Health/Drug MCP 与真实数据库链路完成 5/5 个 case，全部到达
+最新真实在线运行（`66d7ff0`）：Health/Drug MCP 与真实数据库链路完成 5/5 个 case，全部到达
 `SIGNED_OFF` 并生成写回预览；引用有效率、精确标识准确率、缺失信息召回率、任务完成率和
-指标覆盖率均为 1.0，五项零容忍安全计数均为 0。模型端点在五次规划中都发生
+指标覆盖率均为 1.0，五项零容忍安全计数均为 0。每个 case 都独立观察到两个 MCP；模型端点在五次规划中都发生
 `MODEL_UPSTREAM_ERROR` 并显式回退，因此 `realModel=false`、整体 `acceptancePassed=false`。
 这个结果证明业务闭环和降级路径可用，但不代表真实模型质量已经验收。
 

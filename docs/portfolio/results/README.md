@@ -29,6 +29,7 @@ Patient ID、原始证据、服务端点、prompt、隐藏推理或凭据。
 
 ## 最新在线结论
 
-提交 `f358ee1` 的运行在真实 Health/Drug MCP 与数据库上完成 5/5 个 case，聚合指标全部达到
-阈值；模型上游连接被重置，五次规划均显式回退。因此该运行可证明真实业务链路和安全降级，
-但 `realModel=false`、`acceptancePassed=false`，不能作为真实模型质量通过的证据。
+提交 `66d7ff0` 的运行在真实 Health/Drug MCP 与数据库上完成 5/5 个 case，每个 case 都独立
+观察到两个 MCP，聚合指标全部达到阈值；模型上游连接被重置，五次规划均显式回退。因此该
+运行可证明真实业务链路和安全降级，但 `realModel=false`、`acceptancePassed=false`，报告的
+`acceptanceFailureCodes` 为 `MODEL_UPSTREAM_ERROR`，不能作为真实模型质量通过的证据。

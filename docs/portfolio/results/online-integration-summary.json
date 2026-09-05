@@ -1,19 +1,19 @@
 {
   "schemaVersion": "1.0",
-  "generatedAt": "2026-09-05T07:20:14.189065+08:00",
-  "gitSha": "f358ee1ba75ddf8011deb49f784ecbc214193c3a",
+  "generatedAt": "2026-09-05T00:12:36.822502+00:00",
+  "gitSha": "66d7ff03321b8e23dd85d78fb12aaee0c4ee1635",
   "execution": {
     "mode": "online_integration",
+    "healthGateway": "HealthRecordGateway",
+    "drugGateway": "DrugEvidenceGateway",
+    "planner": "ConfiguredStructuredLLMPlanner",
     "network": true,
     "realModel": false,
     "realDatabases": true,
     "completed": true,
-    "observedComponents": {
-      "healthMcpObserved": true,
-      "drugMcpObserved": true,
-      "allCasesCompleted": true,
-      "modelCallSucceeded": false,
-      "modelFallbackObserved": true
+    "services": {
+      "healthMcp": {"observed": true},
+      "drugMcp": {"observed": true}
     }
   },
   "thresholds": {
@@ -41,6 +41,7 @@
     "metricsCoverage": 1.0
   },
   "acceptancePassed": false,
+  "acceptanceFailureCodes": ["MODEL_UPSTREAM_ERROR"],
   "failure": {
     "code": "MODEL_UPSTREAM_ERROR"
   },

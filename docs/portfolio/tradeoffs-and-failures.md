@@ -13,7 +13,7 @@
 
 ## 失败 1：模型上游连接被重置
 
-- 输入条件：2026-09-05、提交 `f358ee1` 的真实五例运行使用外部模型配置；独立最小调用和五次规划都在读取响应时被上游重置连接。
+- 输入条件：2026-09-05、提交 `66d7ff0` 的真实五例运行使用外部模型配置；独立最小调用和五次规划都在读取响应时被上游重置连接。
 - 可见症状：每例都到达 `SIGNED_OFF` 和写回预览，但 `modelCalls` 的 token/usage 不可用且 `modelFallback=true`。
 - 机器码：`MODEL_UPSTREAM_ERROR`。
 - 安全行为：切换 `DeterministicPlanner`，不扩大 patient/product scope、主题、工具权限或循环预算；业务链路完成 5/5，但报告强制 `realModel=false`、`acceptancePassed=false`。
